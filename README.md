@@ -31,6 +31,16 @@ outright (see "Requirements"), and it does not attempt anything PlayCover's
 own *PlayTools* layer does for games — see
 ["What PlayCover still does that this does not"](#what-playcover-still-does-that-this-does-not).
 
+## Legal
+
+Use this only with an app you are entitled to run — one you own or hold a
+license for. Obtaining or decrypting an `.ipa` is out of scope and
+unsupported here: this project starts from an `.ipa` you have already
+decrypted yourself and does not explain, link to, or provide any way to do
+that step. Decrypting an App Store binary may breach Apple's terms of
+service and, depending on where you are, local law; evaluating that risk is
+on you, not something this tool settles for you.
+
 ## Requirements
 
 - **Apple silicon** (arm64) Mac, macOS 14 or later.
@@ -38,10 +48,10 @@ own *PlayTools* layer does for games — see
   `lipo`, `otool`, `vtool`, `install_name_tool`, `codesign`, and `clang` with
   the macOS SDK (for the keychain shim). `unzip`, `plutil`, `xattr`, `file`
   and `python3` are already on every Mac.
-- A **decrypted** `.ipa`. App Store downloads are FairPlay-encrypted
-  (`cryptid 1` in `LC_ENCRYPTION_INFO`); this tool refuses them before
-  touching anything. Decrypting one needs a jailbroken device or an
-  already-decrypted source — nothing here does that part.
+- An `.ipa` you have decrypted yourself — nothing here does that part, and
+  this project does not point at sources. App Store downloads are
+  FairPlay-encrypted (`cryptid 1` in `LC_ENCRYPTION_INFO`); this tool
+  refuses them before touching anything (see ["Legal"](#legal)).
 
 ## Usage
 
@@ -58,13 +68,14 @@ ipa-install-on-mac <file.ipa> [options]
 | `--scaled` | keep the iPad idiom (77%-scaled rendering) instead of the Mac idiom |
 | `--no-keychain` | skip the keychain shim; logins will not survive a relaunch |
 | `--reset` | wipe the app's sandbox container (preferences, caches, the shim's store) before installing |
+| `-h`, `--help` | print usage and exit 0 |
 
 ## How it works
 
 1. **Unpack** the `.ipa` (a zip) and find its one `Payload/*.app`.
 2. **Refuse FairPlay-encrypted binaries** before changing anything — every
    Mach-O in the bundle is checked for `LC_ENCRYPTION_INFO`'s `cryptid`, and
-   a nonzero value stops the run immediately, before anything is modified.
+   a nonzero value stops the run immediately, before anything is installed.
 3. **Thin every Mach-O to arm64** (`lipo -thin`) — frameworks, dylibs and
    extensions too, not just the main executable, because dyld refuses to
    load an iOS-platform image at all inside a Catalyst process.
@@ -83,9 +94,15 @@ ipa-install-on-mac <file.ipa> [options]
    reads that key as a *macOS* requirement, so an iOS 17 app would otherwise
    demand "macOS 17".
 7. **Sign every Mach-O individually**, ad-hoc, then every nested bundle
-   inside-out, then the app itself with a small sandbox entitlement set —
-   see "`codesign --deep` re-signs nothing" below for why both the order
-   and the per-file signing matter.
+   inside-out, then the app itself with a sandbox entitlement set — PlayCover's
+   base set: `app-sandbox` plus network client and server, camera,
+   microphone, Bluetooth, USB, contacts, calendars, location, and
+   read-write access to Photos, Music and Movies. An entitlement only lets
+   the app *ask*; macOS still shows its normal per-capability permission
+   prompt (camera, contacts, location, ...) the first time the app actually
+   uses one, the same as for any other Mac app. See "`codesign --deep`
+   re-signs nothing" below for why both the order and the per-file signing
+   matter.
 8. **Move the bundle into `/Applications`** (or `--dest`). A same-named
    bundle with a *different* bundle id is left alone unless `--force` is
    given; otherwise the previous copy is moved to `~/.Trash` first.
@@ -154,7 +171,7 @@ usual target) needs them:
 
 ## The keychain shim's security trade-off
 
-`lib/ipa-keychain.c` (around 300 lines of C, no dependencies) is linked into
+`lib/ipa-keychain.c` (about 450 lines of C, no dependencies) is linked into
 the app's main executable and interposes the four `SecItem*` entry points
 for generic and internet passwords, storing them in a binary plist inside
 the app's own sandbox container at
@@ -204,7 +221,7 @@ no stable "latest" URL to automate against.
 ## Install
 
 ```
-git clone <this repo> ipa-install-on-mac
+git clone https://github.com/ayush5harma/ipa-install-on-mac
 cd ipa-install-on-mac
 ./install.sh
 ```

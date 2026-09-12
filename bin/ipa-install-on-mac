@@ -35,7 +35,7 @@
 # The installed bundle is user-owned; remove it by dragging to Trash.
 #
 # Usage:
-#   ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain]
+#   ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain] [--reset]
 #     --dest DIR     install into DIR instead of /Applications
 #     --open         launch it afterwards and confirm the process appeared
 #     --force        replace a bundle of the same name even if its bundle id
@@ -45,11 +45,15 @@
 #     --no-keychain  do not link the keychain shim (logins will not persist)
 #     --reset        wipe the app's sandbox container (Data/) before installing:
 #                    preferences, caches, the shim's keychain store (2026-09-06:
-#                    an earlier, differently-signed install left YouTube's
-#                    account in preferences with no matching keychain entry)
+#                    an earlier, differently-signed install of the same app
+#                    left an account in preferences with no matching keychain
+#                    entry)
 
-set -euo pipefail
-# Under set -e a failing pipeline exits with no message; say where.
+set -Eeuo pipefail
+# Under set -e a failing pipeline exits with no message; say where. -E so the
+# trap also fires for a failure inside a function (convert_macho, cryptid_of,
+# resolve_path) rather than only at the top level -- without it bash does not
+# inherit ERR into functions at all.
 trap 'echo "ipa-install-on-mac: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 USAGE_TEXT="Usage: ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain] [--reset]"
@@ -111,8 +115,11 @@ if [ "$KEYCHAIN" -eq 1 ]; then
     printf '%s/%s\n' "$dir" "$(basename "$target")"
   }
   SELF="$(resolve_path "$0")"
-  LIB_DIR="$(cd "$(dirname "$SELF")/../lib" && pwd)"
-  [ -f "$LIB_DIR/ipa-keychain.c" ] && [ -f "$LIB_DIR/ipa-inject-dylib.py" ] \
+  # 2>/dev/null + || true: a cd failure (../lib does not exist at all) must
+  # fall through to the die() below with its --no-keychain suggestion, not
+  # abort here with a raw "no such file or directory" and no such hint.
+  LIB_DIR="$(cd "$(dirname "$SELF")/../lib" 2>/dev/null && pwd || true)"
+  [ -n "$LIB_DIR" ] && [ -f "$LIB_DIR/ipa-keychain.c" ] && [ -f "$LIB_DIR/ipa-inject-dylib.py" ] \
     || die "lib/ipa-keychain.c and lib/ipa-inject-dylib.py not found next to $SELF; pass --no-keychain to skip"
 fi
 
@@ -142,16 +149,34 @@ PLIST="$APP/Info.plist"
 pl() { plutil -extract "$1" raw -o - "$PLIST" 2>/dev/null || true; }
 EXE=$(pl CFBundleExecutable);   [ -n "$EXE" ] || die "Info.plist has no CFBundleExecutable"
 BID=$(pl CFBundleIdentifier);   [ -n "$BID" ] || die "Info.plist has no CFBundleIdentifier"
+# BID becomes a filesystem path twice below (the --reset container wipe, and
+# every install's container note) -- an ipa is untrusted input, so a crafted
+# CFBundleIdentifier such as "../../Documents" must be refused HERE, before
+# it is ever interpolated into a path a later `find` or `rm -rf` could touch.
+# Real bundle ids are reverse-DNS: letters, digits, dots and hyphens only.
+case "$BID" in
+  ""|*/*|*..*|*[!A-Za-z0-9._-]*) die "implausible bundle id: $BID" ;;
+esac
 NAME=$(pl CFBundleDisplayName); [ -n "$NAME" ] || NAME=$(pl CFBundleName); [ -n "$NAME" ] || NAME="$EXE"
 NAME=$(printf '%s' "$NAME" | tr '/:' '__')
 MINOS=$(pl MinimumOSVersion)
 [ -f "$APP/$EXE" ] || die "executable $EXE not found in the bundle"
 echo "  $NAME ($BID), executable $EXE, iOS ${MINOS:-?}+"
 
+# --reset must refuse before ANYTHING else happens, not just before the
+# container is cleared: the previous copy at $DEST/$NAME.app is moved to
+# ~/.Trash further down (in the Install section, well before this script
+# would otherwise reach the container wipe), and finding out only there that
+# the app is still running would leave that copy trashed with nothing yet
+# built to replace it.
+if [ "$RESET" -eq 1 ] && ps -axo comm= | grep -F "/$NAME.app/" >/dev/null; then
+  die "--reset needs the app quit first: a running $NAME would write its state straight back"
+fi
+
 # ── Keychain-fix tweaks: neutralised, the shim is the keychain now ──────────
 # See README.md's "Measured traps": a sideloading tweak that hooks
 # SecItemAdd steals the calls the shim exists for (measured 2026-09-06 on a
-# tweaked app carrying `_ipa_by_iosdecrypted_[sideloadKeychainFix].dylib`).
+# tweaked app carrying a `[sideloadKeychainFix].dylib`).
 # Its load command is not removed -- that would shift the two-level namespace
 # ordinal of every later dylib -- so the FILE is replaced by an empty dylib
 # of the same install name: dyld still finds it, nothing runs.
@@ -206,6 +231,15 @@ convert_macho() {
   case " $archs " in
     *" arm64 "*|*" arm64e "*) ;;
     *) die "no arm64 slice in ${f#"$APP"/} (archs: ${archs:-unknown})" ;;
+  esac
+  # arm64e (pointer authentication) is a distinct slice from plain arm64, and
+  # thinning to "arm64" below is a no-op when arm64e is the ONLY slice present
+  # -- this tool has only been exercised against a plain arm64 slice, so
+  # refuse rather than silently carry an untested arch through vtool and
+  # codesign.
+  case " $archs " in
+    *" arm64 "*) ;;
+    *) die "${f#"$APP"/} has only an arm64e slice (archs: $archs); this tool needs a plain arm64 slice -- ask upstream for one, or --keep and convert it by hand" ;;
   esac
   if [ "$(printf '%s\n' "$archs" | wc -w)" -gt 1 ]; then
     "$LIPO" -thin arm64 -output "$f.thin" "$f" && mv -f "$f.thin" "$f" || die "lipo -thin failed on ${f#"$APP"/}"
@@ -344,11 +378,10 @@ fi
 # --reset: the container root is containermanagerd's and cannot be moved or
 # removed from a shell without Full Disk Access, but its contents can. Flush
 # cfprefsd's cached copy of the container-scoped defaults first, or the plist
-# comes back from memory on the next launch.
+# comes back from memory on the next launch. (Already refused above, right
+# after NAME was known and before the previous copy went to Trash, if the
+# app was still running.)
 if [ "$RESET" -eq 1 ]; then
-  if ps -axo comm= | grep -F "/$NAME.app/" >/dev/null; then
-    die "--reset needs the app quit first: a running $NAME would write its state straight back"
-  fi
   CONT="$HOME/Library/Containers/$BID/Data"
   if [ -d "$CONT" ]; then
     # Through cfprefsd, so its cached copy of the container-scoped domain goes
