@@ -52,10 +52,14 @@ set -euo pipefail
 # Under set -e a failing pipeline exits with no message; say where.
 trap 'echo "ipa-install-on-mac: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
-usage() {
-  echo "Usage: ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain] [--reset]" >&2
-  exit 1
-}
+USAGE_TEXT="Usage: ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain] [--reset]"
+# Two exits for the same text: a bad invocation (missing/unknown argument, no
+# ipa given) is a usage ERROR -- stderr, exit 1, the shell convention -- while
+# an explicit -h/--help asked for exactly this text and gets it on stdout with
+# exit 0, so `ipa-install-on-mac --help` is script- and pipe-friendly (`... |
+# head`, `... && echo ok`) rather than always tripping `set -e` in a caller.
+usage() { echo "$USAGE_TEXT" >&2; exit 1; }
+help()  { echo "$USAGE_TEXT"; exit 0; }
 die()  { echo "ipa-install-on-mac: $*" >&2; exit 2; }
 warn() { echo "ipa-install-on-mac: warning: $*" >&2; }
 
@@ -69,7 +73,7 @@ while [ $# -gt 0 ]; do
     --scaled)      SCALED=1; shift ;;
     --no-keychain) KEYCHAIN=0; shift ;;
     --reset)       RESET=1; shift ;;
-    -h|--help) usage ;;
+    -h|--help) help ;;
     -*) usage ;;
     *) [ -z "$IPA" ] || usage; IPA="$1"; shift ;;
   esac
