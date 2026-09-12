@@ -1,0 +1,16 @@
+# macOS noise
+.DS_Store
+
+# Python bytecode cache, if lib/ipa-inject-dylib.py is ever imported instead
+# of run directly
+__pycache__/
+*.pyc
+
+# Compiled artifacts if the keychain shim is built or tested locally, outside
+# the installer's own temporary work directory (under $TMPDIR, never here)
+*.o
+*.dylib
+
+# Never track a real .ipa or an installed .app bundle in this repo
+*.ipa
+*.app/

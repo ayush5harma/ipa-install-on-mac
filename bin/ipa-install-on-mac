@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# Install a decrypted iOS .ipa as a Mac app that renders at the Mac's own
+# resolution and keeps its logins: re-signed, placed in /Applications, no
+# PlayCover.
+#
+# See README.md for why PlayCover was rejected and the full mechanism (the
+# six steps PlayCover's own installer takes, each with an Xcode CLI
+# equivalent: lipo, vtool, install_name_tool, codesign), the measured traps,
+# and the security trade-off of the keychain shim. This script does those six
+# steps plus the two PlayTools features an APP (not a game) needs:
+#
+#   RESOLUTION -- UIKit reads UIDeviceFamily from the bundle at launch, and
+#   with 6 (Mac) present the process runs in UIUserInterfaceIdiom.mac: 1:1
+#   with Mac points instead of the iPad layout scaled to 77% (measured
+#   2026-09-06: idiom 1 -> 5 from that one plist edit). --scaled keeps the
+#   shipped families instead.
+#
+#   KEYCHAIN -- an ad-hoc signature has no application-identifier, so
+#   SecItemAdd answers -34018 (errSecMissingEntitlement) and no login
+#   survives a relaunch; AMFI also refuses to spawn an ad-hoc binary that
+#   claims keychain-access-groups. The fix is PlayChain's: lib/ipa-keychain.c,
+#   built here into Frameworks/libipakeychain.dylib and linked into the main
+#   executable (lib/ipa-inject-dylib.py), interposing the four SecItem calls
+#   into a 0600 plist inside the app's sandbox container. --no-keychain
+#   leaves the app as shipped.
+#
+# WHAT IT NEEDS
+#   - A DECRYPTED ipa. App Store downloads are FairPlay-encrypted (cryptid 1
+#     in LC_ENCRYPTION_INFO); the script refuses them before touching
+#     anything. Decrypting needs a jailbroken device or an already-decrypted
+#     source; nothing here does it.
+#   - Xcode: lipo, otool, vtool, install_name_tool, file, and clang with the
+#     macOS SDK for the shim; codesign, plutil, xattr and python3 are macOS.
+#
+# The installed bundle is user-owned; remove it by dragging to Trash.
+#
+# Usage:
+#   ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain]
+#     --dest DIR     install into DIR instead of /Applications
+#     --open         launch it afterwards and confirm the process appeared
+#     --force        replace a bundle of the same name even if its bundle id
+#                    differs (a Mac app that happens to share the name)
+#     --keep         keep the work directory for inspection
+#     --scaled       keep the iPad idiom (the 77% scaled rendering)
+#     --no-keychain  do not link the keychain shim (logins will not persist)
+#     --reset        wipe the app's sandbox container (Data/) before installing:
+#                    preferences, caches, the shim's keychain store (2026-09-06:
+#                    an earlier, differently-signed install left YouTube's
+#                    account in preferences with no matching keychain entry)
+
+set -euo pipefail
+# Under set -e a failing pipeline exits with no message; say where.
+trap 'echo "ipa-install-on-mac: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+usage() {
+  echo "Usage: ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain] [--reset]" >&2
+  exit 1
+}
+die()  { echo "ipa-install-on-mac: $*" >&2; exit 2; }
+warn() { echo "ipa-install-on-mac: warning: $*" >&2; }
+
+IPA=""; DEST="/Applications"; OPEN=0; FORCE=0; KEEP=0; SCALED=0; KEYCHAIN=1; RESET=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dest)  [ $# -ge 2 ] || usage; DEST="$2"; shift 2 ;;
+    --open)  OPEN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --keep)  KEEP=1; shift ;;
+    --scaled)      SCALED=1; shift ;;
+    --no-keychain) KEYCHAIN=0; shift ;;
+    --reset)       RESET=1; shift ;;
+    -h|--help) usage ;;
+    -*) usage ;;
+    *) [ -z "$IPA" ] || usage; IPA="$1"; shift ;;
+  esac
+done
+[ -n "$IPA" ] || usage
+[ -f "$IPA" ] || die "no such file: $IPA"
+
+# ── Tools ───────────────────────────────────────────────────────────────────
+for t in unzip plutil codesign xattr file; do
+  command -v "$t" >/dev/null 2>&1 || die "missing $t"
+done
+for t in lipo otool vtool install_name_tool; do
+  xcrun -f "$t" >/dev/null 2>&1 || die "missing $t: install Xcode or the Command Line Tools (xcode-select --install)"
+done
+LIPO=$(xcrun -f lipo); OTOOL=$(xcrun -f otool); VTOOL=$(xcrun -f vtool); INT=$(xcrun -f install_name_tool)
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+if [ "$KEYCHAIN" -eq 1 ]; then
+  command -v python3 >/dev/null 2>&1 || die "missing python3 (needed to link the keychain shim; or pass --no-keychain)"
+  SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode or pass --no-keychain"
+  # The shim's source and the load-command editor live in ../lib relative to
+  # this script's REAL location (not $0 as typed), so a symlink into
+  # ~/.local/bin (see install.sh) still finds them: resolve every level of
+  # symlink by hand rather than relying on `readlink -f`, which is a GNU
+  # extension and not the BSD readlink macOS ships.
+  resolve_path() {
+    local target="$1" link dir
+    while [ -L "$target" ]; do
+      link="$(readlink "$target")"
+      case "$link" in
+        /*) target="$link" ;;
+        *)  target="$(dirname "$target")/$link" ;;
+      esac
+    done
+    dir="$(cd "$(dirname "$target")" && pwd)"
+    printf '%s/%s\n' "$dir" "$(basename "$target")"
+  }
+  SELF="$(resolve_path "$0")"
+  LIB_DIR="$(cd "$(dirname "$SELF")/../lib" && pwd)"
+  [ -f "$LIB_DIR/ipa-keychain.c" ] && [ -f "$LIB_DIR/ipa-inject-dylib.py" ] \
+    || die "lib/ipa-keychain.c and lib/ipa-inject-dylib.py not found next to $SELF; pass --no-keychain to skip"
+fi
+
+# ── Unpack ──────────────────────────────────────────────────────────────────
+# The work dir is under TMPDIR, the same APFS volume as /Applications, so the
+# final move is a rename: a reader never sees a half-copied bundle.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/ipa-install-on-mac.XXXXXX")
+cleanup() { if [ "$KEEP" -eq 1 ]; then echo "work dir kept: $WORK"; else rm -rf "$WORK"; fi; }
+trap cleanup EXIT
+
+# grep without -q: under pipefail an early exit would SIGPIPE the producer.
+unzip -l "$IPA" 2>/dev/null | grep 'Payload/[^/]*\.app/Info\.plist' >/dev/null \
+  || die "not an ipa (no Payload/<App>.app/Info.plist inside): $IPA"
+echo "Unpacking $(basename "$IPA") ..."
+unzip -q "$IPA" -d "$WORK/x" || die "unzip failed"
+
+APP=""
+n=0
+for d in "$WORK"/x/Payload/*.app; do
+  [ -d "$d" ] || continue
+  APP="$d"; n=$((n + 1))
+done
+[ "$n" -eq 1 ] || die "expected exactly one .app under Payload/, found $n"
+
+PLIST="$APP/Info.plist"
+[ -f "$PLIST" ] || die "no Info.plist in $(basename "$APP")"
+pl() { plutil -extract "$1" raw -o - "$PLIST" 2>/dev/null || true; }
+EXE=$(pl CFBundleExecutable);   [ -n "$EXE" ] || die "Info.plist has no CFBundleExecutable"
+BID=$(pl CFBundleIdentifier);   [ -n "$BID" ] || die "Info.plist has no CFBundleIdentifier"
+NAME=$(pl CFBundleDisplayName); [ -n "$NAME" ] || NAME=$(pl CFBundleName); [ -n "$NAME" ] || NAME="$EXE"
+NAME=$(printf '%s' "$NAME" | tr '/:' '__')
+MINOS=$(pl MinimumOSVersion)
+[ -f "$APP/$EXE" ] || die "executable $EXE not found in the bundle"
+echo "  $NAME ($BID), executable $EXE, iOS ${MINOS:-?}+"
+
+# ── Keychain-fix tweaks: neutralised, the shim is the keychain now ──────────
+# See README.md's "Measured traps": a sideloading tweak that hooks
+# SecItemAdd steals the calls the shim exists for (measured 2026-09-06 on a
+# tweaked app carrying `_ipa_by_iosdecrypted_[sideloadKeychainFix].dylib`).
+# Its load command is not removed -- that would shift the two-level namespace
+# ordinal of every later dylib -- so the FILE is replaced by an empty dylib
+# of the same install name: dyld still finds it, nothing runs.
+NEUTRALISED=""
+if [ "$KEYCHAIN" -eq 1 ]; then
+  printf 'void ipa_neutralised(void) {}\n' > "$WORK/noop.c"
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    oldid=$("$OTOOL" -D "$f" 2>/dev/null | sed -n '2p')
+    [ -n "$oldid" ] || continue
+    xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -dynamiclib -install_name "$oldid" \
+      -o "$f" "$WORK/noop.c" 2>"$WORK/noop.err" \
+      || die "could not neutralise ${f#"$APP"/}: $(tr '\n' ' ' < "$WORK/noop.err")"
+    NEUTRALISED="$NEUTRALISED ${f#"$APP"/}"
+  done < <(find "$APP" -type f -iname '*.dylib' | grep -iE 'keychain.?fix|sideload.?keychain' || true)
+  [ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
+fi
+
+# ── Every Mach-O in the bundle ──────────────────────────────────────────────
+# Frameworks, dylibs and extensions must be converted too: dyld refuses to load
+# an iOS-platform image into a Catalyst process.
+# `file` exits non-zero on an odd file and xargs then returns 123, which under
+# pipefail aborted the script with no message on a real app (a ~4000-file
+# tweaked app). Capture first, tolerate the status, filter second.
+MACHOS="$WORK/machos"
+{ find "$APP" -type f -print0 | xargs -0 file --no-dereference -F "$(printf '\t')"; } > "$WORK/file.out" 2>/dev/null || true
+# A fat binary gets extra lines "path (for architecture X):" after its own;
+# drop those or lipo is handed a name that does not exist.
+awk -F '\t' '$2 ~ /Mach-O/ && $1 !~ / \(for architecture [^)]*\):?$/ { print $1 }' "$WORK/file.out" | sort -u > "$MACHOS"
+[ -s "$MACHOS" ] || die "no Mach-O binaries found in the bundle"
+
+# ── Refuse FairPlay-encrypted binaries before changing anything ─────────────
+cryptid_of() {  # first cryptid in the file's LC_ENCRYPTION_INFO(_64), or empty
+  # awk reads to the end on purpose: exiting at the first hit SIGPIPEs otool
+  # on a binary with many load commands, and pipefail then fails the pipeline.
+  "$OTOOL" -l "$1" 2>/dev/null | awk '/LC_ENCRYPTION_INFO/ { f = 1 } f && /cryptid/ && !d { print $2; d = 1 }' || true
+}
+ENCRYPTED=""
+while IFS= read -r f; do
+  c=$(cryptid_of "$f")
+  if [ -n "$c" ] && [ "$c" != "0" ]; then ENCRYPTED="$ENCRYPTED  ${f#"$APP"/}"$'\n'; fi
+done < "$MACHOS"
+if [ -n "$ENCRYPTED" ]; then
+  printf 'ipa-install-on-mac: %s is FairPlay-encrypted (cryptid 1), still an App Store copy:\n%s' "$NAME" "$ENCRYPTED" >&2
+  die "decrypt it first; this tool does not (and cannot) remove FairPlay"
+fi
+
+# ── Convert: arm64 only, Mac Catalyst platform, system Swift UIKit overlay ──
+convert_macho() {
+  local f="$1" archs
+  archs=$("$LIPO" -archs "$f" 2>/dev/null || true)
+  case " $archs " in
+    *" arm64 "*|*" arm64e "*) ;;
+    *) die "no arm64 slice in ${f#"$APP"/} (archs: ${archs:-unknown})" ;;
+  esac
+  if [ "$(printf '%s\n' "$archs" | wc -w)" -gt 1 ]; then
+    "$LIPO" -thin arm64 -output "$f.thin" "$f" && mv -f "$f.thin" "$f" || die "lipo -thin failed on ${f#"$APP"/}"
+  fi
+  # PlayCover's exact target values; LaunchServices then treats the bundle as
+  # a Catalyst app, which an ad-hoc signature is allowed to launch.
+  "$VTOOL" -set-build-version maccatalyst 11.0 14.0 -replace -output "$f.vt" "$f" >/dev/null 2>"$WORK/vtool.err" \
+    && mv -f "$f.vt" "$f" \
+    || die "vtool could not rewrite the platform of ${f#"$APP"/}: $(tr '\n' ' ' < "$WORK/vtool.err")"
+  # /usr/lib/swift has no UIKit overlay on macOS; Catalyst's copy lives under
+  # /System/iOSSupport. Only this one overlay is iOS-specific.
+  if "$OTOOL" -L "$f" 2>/dev/null | grep '@rpath/libswiftUIKit\.dylib' >/dev/null; then
+    "$INT" -change @rpath/libswiftUIKit.dylib /System/iOSSupport/usr/lib/swift/libswiftUIKit.dylib "$f" 2>/dev/null \
+      || warn "could not repoint libswiftUIKit in ${f#"$APP"/}; the app may fail to launch"
+  fi
+}
+COUNT=0
+while IFS= read -r f; do
+  convert_macho "$f"
+  COUNT=$((COUNT + 1))
+done < "$MACHOS"
+chmod 755 "$APP/$EXE"
+rm -f "$APP/embedded.mobileprovision"
+
+# LaunchServices reads MinimumOSVersion as a system requirement once the
+# platform says Catalyst; an iOS 17 app would otherwise "need macOS 17".
+if [ -n "$MINOS" ] && [ "$(printf '%s\n11.0\n' "$MINOS" | sort -V | tail -1)" != "11.0" ]; then
+  plutil -replace MinimumOSVersion -string 11.0 "$PLIST" >/dev/null
+fi
+
+# ── Rendering: the Mac idiom ────────────────────────────────────────────────
+# UIKit decides the idiom from UIDeviceFamily at launch; 6 = Mac. Appended,
+# never replaced, so an iPhone-only app keeps its 1.
+if [ "$SCALED" -eq 0 ]; then
+  fams=$(plutil -extract UIDeviceFamily json -o - "$PLIST" 2>/dev/null || true)
+  case "$fams" in
+    "")                          plutil -insert UIDeviceFamily -json '[1,2,6]' "$PLIST" >/dev/null ;;
+    *[!0-9]6[!0-9]*|*[!0-9]6)    ;;
+    *)                           plutil -insert UIDeviceFamily -integer 6 -append "$PLIST" >/dev/null ;;
+  esac
+  RENDER="Mac idiom, 1:1 with the display (UIDeviceFamily $(plutil -extract UIDeviceFamily json -o - "$PLIST" 2>/dev/null))"
+else
+  RENDER="scaled iPad idiom (--scaled)"
+fi
+
+# ── Keychain: the file-backed shim, linked into the main executable ─────────
+if [ "$KEYCHAIN" -eq 1 ]; then
+  SHIM="$APP/Frameworks/libipakeychain.dylib"
+  mkdir -p "$APP/Frameworks"
+  xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -O2 -dynamiclib \
+    -framework CoreFoundation -framework Security \
+    -install_name @executable_path/Frameworks/libipakeychain.dylib \
+    -o "$SHIM" "$LIB_DIR/ipa-keychain.c" 2>"$WORK/clang.err" \
+    || die "could not build the keychain shim: $(tr '\n' ' ' < "$WORK/clang.err")"
+  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" @executable_path/Frameworks/libipakeychain.dylib >/dev/null 2>"$WORK/inject.err" \
+    || die "could not link the keychain shim into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
+  printf '%s\n' "$SHIM" >> "$MACHOS"
+  KEYCHAIN_NOTE="file-backed shim; items in the container under Library/Application Support/ipa-keychain"
+else
+  KEYCHAIN_NOTE="as shipped (--no-keychain): logins will not survive a relaunch"
+fi
+
+# ── Sign ────────────────────────────────────────────────────────────────────
+# PlayCover's base set: sandboxed (so the app gets its own container instead
+# of writing into ~/Documents), with the capability entitlements that let a
+# sandboxed app ASK for camera, mic, location, contacts, calendars, files.
+ENTS="$WORK/entitlements.plist"
+cat > "$ENTS" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.apple.security.app-sandbox</key><true/>
+  <key>com.apple.security.network.client</key><true/>
+  <key>com.apple.security.network.server</key><true/>
+  <key>com.apple.security.device.camera</key><true/>
+  <key>com.apple.security.device.audio-input</key><true/>
+  <key>com.apple.security.device.bluetooth</key><true/>
+  <key>com.apple.security.device.usb</key><true/>
+  <key>com.apple.security.files.downloads.read-write</key><true/>
+  <key>com.apple.security.files.user-selected.read-write</key><true/>
+  <key>com.apple.security.personal-information.addressbook</key><true/>
+  <key>com.apple.security.personal-information.calendars</key><true/>
+  <key>com.apple.security.personal-information.location</key><true/>
+  <key>com.apple.security.assets.movies.read-write</key><true/>
+  <key>com.apple.security.assets.music.read-write</key><true/>
+  <key>com.apple.security.assets.pictures.read-write</key><true/>
+  <key>com.apple.security.print</key><true/>
+</dict></plist>
+PLIST
+echo "Signing (ad-hoc, $COUNT Mach-O binaries converted to Mac Catalyst) ..."
+# Every Mach-O is signed on its own, as PlayCover does after each conversion:
+# `codesign --deep` finds NO nested code in an iOS flat bundle (no Contents/),
+# so the frameworks would keep the signature of the bytes vtool had just
+# rewritten and the kernel would kill the process at dyld's first page
+# (measured 2026-09-06: SIGKILL, CODESIGNING Invalid Page).
+while IFS= read -r f; do
+  codesign --force --sign - "$f" 2>"$WORK/codesign.err" \
+    || die "codesign failed on ${f#"$APP"/}: $(tr '\n' ' ' < "$WORK/codesign.err")"
+done < "$MACHOS"
+# Then each nested bundle, inside-out, so their seals match the new binaries.
+find "$APP" -depth -mindepth 1 -type d \( -name '*.framework' -o -name '*.appex' -o -name '*.bundle' \) -print0 \
+  | while IFS= read -r -d '' b; do
+      [ -f "$b/Info.plist" ] || continue
+      codesign --force --sign - "$b" 2>/dev/null || true
+    done
+codesign --force --sign - --entitlements "$ENTS" "$APP" 2>"$WORK/codesign.err" \
+  || die "codesign failed: $(tr '\n' ' ' < "$WORK/codesign.err")"
+# Verify every Mach-O the way dyld will, not just the bundle seal.
+BAD=""
+while IFS= read -r f; do
+  codesign --verify --strict "$f" 2>/dev/null || BAD="$BAD  ${f#"$APP"/}"$'\n'
+done < "$MACHOS"
+[ -z "$BAD" ] || die "these binaries would be killed at load (signature does not verify):"$'\n'"$BAD"
+codesign --verify --strict "$APP" 2>"$WORK/verify.err" \
+  || die "bundle signature does not verify: $(tr '\n' ' ' < "$WORK/verify.err")"
+xattr -rd com.apple.quarantine "$APP" 2>/dev/null || true
+
+# ── Install ─────────────────────────────────────────────────────────────────
+mkdir -p "$DEST" 2>/dev/null || die "cannot create $DEST"
+[ -w "$DEST" ] || die "$DEST is not writable"
+TARGET="$DEST/$NAME.app"
+if [ -e "$TARGET" ]; then
+  OLD_BID=$(plutil -extract CFBundleIdentifier raw -o - "$TARGET/Info.plist" 2>/dev/null \
+         || plutil -extract CFBundleIdentifier raw -o - "$TARGET/Contents/Info.plist" 2>/dev/null || true)
+  if [ "$OLD_BID" != "$BID" ] && [ "$FORCE" -ne 1 ]; then
+    die "$TARGET exists with bundle id ${OLD_BID:-unknown} (not $BID); pass --force to replace it or --dest DIR"
+  fi
+  TRASH="$HOME/.Trash/$NAME.app.$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "$HOME/.Trash"
+  if mv "$TARGET" "$TRASH" 2>/dev/null; then
+    echo "  previous copy moved to ~/.Trash/$(basename "$TRASH")"
+  else
+    rm -rf "$TARGET" || die "cannot replace $TARGET"
+  fi
+fi
+# --reset: the container root is containermanagerd's and cannot be moved or
+# removed from a shell without Full Disk Access, but its contents can. Flush
+# cfprefsd's cached copy of the container-scoped defaults first, or the plist
+# comes back from memory on the next launch.
+if [ "$RESET" -eq 1 ]; then
+  if ps -axo comm= | grep -F "/$NAME.app/" >/dev/null; then
+    die "--reset needs the app quit first: a running $NAME would write its state straight back"
+  fi
+  CONT="$HOME/Library/Containers/$BID/Data"
+  if [ -d "$CONT" ]; then
+    # Through cfprefsd, so its cached copy of the container-scoped domain goes
+    # too (deleting only the plist brought the old values back on relaunch).
+    defaults delete "$CONT/Library/Preferences/$BID" >/dev/null 2>&1 || true
+    # find -exec, not a glob: an unmatched glob is fatal under zsh's nomatch
+    # and shellcheck's SC2115 objects to `rm -rf "$var"/*`.
+    find "$CONT" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+    echo "  reset: container state under ~/Library/Containers/$BID/Data cleared"
+  fi
+fi
+mv "$APP" "$TARGET" || die "could not move the bundle into $DEST"
+[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$TARGET" >/dev/null 2>&1 || true
+
+echo "Installed $TARGET"
+echo "  bundle id $BID, signed ad-hoc, sandboxed (container: ~/Library/Containers/$BID)"
+if [ "$RESET" -eq 0 ] && [ -d "$HOME/Library/Containers/$BID/Data/Library" ]; then
+  echo "  container from an earlier install kept (preferences, caches, keychain store); --reset starts it clean"
+fi
+echo "  rendering: $RENDER"
+echo "  keychain:  $KEYCHAIN_NOTE"
+[ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
+
+if [ "$OPEN" -eq 1 ]; then
+  echo "Launching ..."
+  open "$TARGET" || die "open failed"
+  i=0
+  while [ $i -lt 30 ]; do
+    if ps -axo comm= | grep -Fx "$TARGET/$EXE" >/dev/null; then
+      echo "  running: $EXE"
+      exit 0
+    fi
+    sleep 0.5; i=$((i + 1))
+  done
+  die "the app did not stay running for 15 s; see Console.app > Crash Reports for $EXE"
+else
+  echo "Launch with: open \"$TARGET\""
+fi
