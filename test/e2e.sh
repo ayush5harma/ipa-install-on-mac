@@ -6,6 +6,8 @@
 # lands, and every touch it received. Only lines logged after each launch's
 # own marker count, so nothing an earlier launch wrote can pass a check.
 #
+# Three installs and a --configure, 22 checks:
+#
 #   default     shipped idiom, the binary's own SDK kept, sandboxed, the
 #               embedded framework loads, dlsym(RTLD_DEFAULT, "gl...") answers
 #               OpenGL ES, and a keychain item survives a relaunch (the shim)
@@ -18,10 +20,15 @@
 #   configure   --configure --resolution 1600x900 takes effect on relaunch
 #
 # The key press goes through System Events, so the terminal needs
-# Accessibility; without it that one check is skipped, loudly. Leaves nothing
-# behind but the probe's sandbox container, which containermanagerd owns.
+# Accessibility; without it that one check is skipped, loudly. What is left
+# behind: the probe's sandbox container, which containermanagerd owns, and
+# one copy of the probe in ~/.Trash per install that replaced another (the
+# installer trashes the previous copy, and these three share a directory).
 #
 # Usage: test/e2e.sh
+#        env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin test/e2e.sh
+#          -- the same run with the tools a stock macOS has: /bin/bash 3.2
+#             through the #! line, and /usr/bin/python3 3.9
 
 set -uo pipefail
 
@@ -39,8 +46,26 @@ PASS=0; FAIL=0; SKIP=0; MARK=""
 ok()   { echo "  PASS  $*"; PASS=$((PASS + 1)); }
 bad()  { echo "  FAIL  $*"; FAIL=$((FAIL + 1)); }
 skip() { echo "  SKIP  $*"; SKIP=$((SKIP + 1)); }
+# check WHAT COMMAND...: the command decides, and every check reads the same.
 check() { local what="$1"; shift; if "$@"; then ok "$what"; else bad "$what"; fi; }
-quit_probe() { pkill -f "$APP/Probe" 2>/dev/null; for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f "$APP/Probe" >/dev/null || return 0; sleep 0.3; done; }
+
+# ── What the installed app says about itself ────────────────────────────────
+# grep without -q on the reading side of a pipe: -q exits at the first match
+# and SIGPIPEs the producer, which pipefail then counts as a failed check.
+entitlements() { codesign -d --entitlements - "$APP" 2>/dev/null; }
+has_entitlement()  { entitlements | grep -F "$1" >/dev/null; }
+lacks_entitlement() { ! entitlements | grep -F "$1" >/dev/null; }
+links() { otool -L "$APP/Probe" 2>/dev/null | grep -F "$1" >/dev/null; }
+stamped_sdk() { otool -l "$APP/Probe" | grep -A4 LC_BUILD_VERSION | grep -F "sdk $1" >/dev/null; }
+reported() { grep -F "$1" "$W/out" >/dev/null; }   # a line of the installer's summary
+
+quit_probe() {
+  pkill -f "$APP/Probe" 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f "$APP/Probe" >/dev/null || return 0
+    sleep 0.3
+  done
+}
 cleanup() {
   quit_probe
   rm -rf "$W"
@@ -71,7 +96,13 @@ launch() {
   for _ in $(seq 1 40); do logged ' launch ' && return 0; sleep 0.25; done
   return 1
 }
-install() { "$CLI" "$W/probe.ipa" --dest "$W/apps" "$@" >"$W/out" 2>"$W/err" || { bad "install $*: $(cat "$W/err")"; exit 1; }; }
+# Install the probe into the scratch directory; its summary goes to $W/out,
+# which the checks below read. An install that fails ends the run: every
+# check after it would be measuring the previous install.
+install_probe() {
+  "$CLI" "$W/probe.ipa" --dest "$W/apps" "$@" >"$W/out" 2>"$W/err" \
+    || { bad "install $*: $(cat "$W/err")"; exit 1; }
+}
 
 echo "Building the probe ..."
 "$HERE/make-probe-ipa.sh" "$W/probe.ipa" >/dev/null || { echo "could not build the probe (needs Xcode's iOS SDK)"; exit 2; }
@@ -79,10 +110,10 @@ unzip -q -o "$W/probe.ipa" 'Payload/Probe.app/Probe' -d "$W/x"
 SDK=$(otool -l "$W/x/Payload/Probe.app/Probe" | awk '/LC_BUILD_VERSION/ { c = 1 } c && $1 == "sdk" && !d { print $2; d = 1 }')
 
 echo "default install"
-install --reset
-check "the binary keeps its own SDK ($SDK)" sh -c "otool -l '$APP/Probe' | grep -A4 LC_BUILD_VERSION | grep -q 'sdk $SDK'"
-check "sandboxed" sh -c "codesign -d --entitlements - '$APP' 2>/dev/null | grep -q app-sandbox"
-check "OpenGL ES redirect linked (the probe links OpenGL ES)" grep -q 'opengl es:' "$W/out"
+install_probe --reset
+check "the binary keeps its own SDK ($SDK)" stamped_sdk "$SDK"
+check "sandboxed" has_entitlement app-sandbox
+check "OpenGL ES redirect linked (the probe links OpenGL ES)" reported 'opengl es:'
 if launch; then
   check "shipped idiom (iPad, 1)" logged ' launch idiom=1 '
   check "embedded framework loaded" logged 'probekit ok'
@@ -98,8 +129,8 @@ else
 fi
 
 echo "--mac-idiom and --dylib install"
-install --mac-idiom --dylib "$HERE/extra.c"
-check "summary names the extra library" grep -q 'libextra.dylib (--dylib)' "$W/out"
+install_probe --mac-idiom --dylib "$HERE/extra.c"
+check "summary names the extra library" reported 'libextra.dylib (--dylib)'
 if launch; then
   check "Mac idiom (5)" logged ' launch idiom=5 '
   check "the --dylib source was built, linked and loaded" logged 'extra dylib loaded'
@@ -108,12 +139,15 @@ else
 fi
 
 echo "--playtools install"
-rm -f "$PC/PlayChain/$BID.db"
-install --resolution 1080p --aspect 16:9 --map K=0.25,0.75
-check "PlayTools linked" sh -c "otool -L '$APP/Probe' | grep -q 'PlayTools.framework/PlayTools'"
+rm -f "$PC/PlayChain/$BID.db"      # so the keychain check sees a first write
+install_probe --resolution 1080p --aspect 16:9 --map K=0.25,0.75
+check "PlayTools linked" links 'PlayTools.framework/PlayTools'
 check "AKInterface in the app's PlugIns" test -d "$APP/PlugIns/AKInterface.bundle"
-check "summary reports the keymap" grep -q 'K@0.25,0.75' "$W/out"
-check "sandbox rules name this app only" sh -c "codesign -d --entitlements - '$APP' 2>/dev/null | grep -q 'PlayChain/$BID.db' && ! codesign -d --entitlements - '$APP' 2>/dev/null | grep -q 'subpath \"$PC\")'"
+check "summary reports the keymap" reported 'K@0.25,0.75'
+# This app's own PlayChain database, and not a subpath of the directory that
+# holds every other PlayTools app's.
+check "sandbox rules name this app only" has_entitlement "PlayChain/$BID.db"
+check "sandbox rules do not open the whole directory" lacks_entitlement "subpath \"$PC\")"
 if launch; then
   check "screen forced to 1920x1080" logged 'screen=1920x1080 '
   check "device model spoofed" logged 'hw.machine=iPad13,8'
