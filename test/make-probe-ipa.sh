@@ -33,8 +33,8 @@ for kv in CFBundleIdentifier=local.ipa-install-on-mac.probekit CFBundleExecutabl
 done
 
 xcrun clang -target "$TARGET" -isysroot "$SDK" -fobjc-arc -fmodules \
-  -Wall -Wextra -Wno-unused-parameter \
-  -framework UIKit -framework Foundation \
+  -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
+  -framework UIKit -framework Foundation -framework Security -framework OpenGLES \
   -Wl,-rpath,@executable_path/Frameworks \
   "$APP/Frameworks/ProbeKit.framework/ProbeKit" \
   -o "$APP/Probe" "$HERE/probe.m"

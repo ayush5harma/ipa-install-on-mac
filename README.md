@@ -311,8 +311,15 @@ resolution option) brings it in without PlayCover.app:
   `/Users/<you>/Library/Containers/io.playcover.PlayCover/` for its settings
   (`App Settings/<bundle id>.plist`), keymaps (`Keymapping/<bundle id>/`)
   and PlayChain (`PlayChain/<bundle id>.db`); `lib/playtools-config.py`
-  writes the first two, the app gets PlayCover's sandbox rule for that
-  directory. Both files are decoded all-or-nothing (one missing key and
+  writes the first two. The app's sandbox exception names only its own
+  files there — settings read-only, its keymap directory and its PlayChain
+  database read-write — where PlayCover grants every game read-write on the
+  whole directory (which holds every other game's plaintext PlayChain), read
+  on every Group Container and write on `.GlobalPreferences`; an `.ipa` is
+  untrusted input. The installer also creates the keymap directory and an
+  empty PlayChain database: PlayTools' own first connection creates the
+  file and then fails the call (`PlayedAppleDB.connectToDB`), so an app's
+  first keychain write would otherwise be lost. Both files are decoded all-or-nothing (one missing key and
   PlayTools falls back to its own defaults for every key), so the settings
   file is always written whole, keeping earlier values; the keys are the
   superset PlayCover itself writes, so PlayCover.app reads the same file.
@@ -331,7 +338,8 @@ probe app in `test/`: `--resolution 1080p` gives the app a 1920x1080 screen
 with `--map K=0.25,0.75` arrives as a touch at exactly that fraction of the
 window, K typed into a focused text field arrives as the letter, the editor
 opens, draws the key where it was set and saves it back unchanged, and
-`--configure --resolution 1440p` gives 2560x1440 on the next launch. Not
+`--configure --resolution 1600x900` applies on the next launch, and a
+keychain item written through PlayChain is read back after a relaunch. Not
 wired up: PlayTools' opt-in jailbreak-detection bypass (`USE_EXTRA_ANTIJB`),
 Discord presence (written off), user plugins.
 
@@ -339,10 +347,14 @@ Discord presence (written off), user plugins.
 
 `test/e2e.sh` builds the probe app (`test/probe.m`: logs its idiom, screen,
 device model, touches, key presses and text input into its container),
-installs it three ways and judges each by what the probe logged: a default
-install (shipped idiom, own SDK kept, sandboxed), a `--playtools` install
-(forced resolution, spoofed model, a mapped key becoming a touch) and a
-`--configure` change taking effect on relaunch. The key press goes through
+installs it four ways and judges each by what the probe logged after that
+launch's own marker: a default install (shipped idiom, own SDK kept,
+sandboxed, a GL lookup answered by OpenGL ES, a keychain item surviving a
+relaunch), `--mac-idiom`, a `--playtools` install (forced resolution,
+spoofed model, a mapped key becoming a touch, PlayChain surviving a
+relaunch, sandbox rules naming only this app) and a `--configure` change
+taking effect on relaunch — 19 checks, green with stock bash 3.2 and
+Python 3.9 as well. The key press goes through
 System Events, so the terminal needs Accessibility. It needs Xcode's iOS SDK
 and, for the PlayTools part, the one-time PlayTools build.
 

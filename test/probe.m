@@ -11,9 +11,16 @@
 //            fraction of the view -- a keymapped key arrives as a touch
 //   press    hardware key presses that reach the responder chain
 //   text     the text field's contents as typed
+//   keychain a generic password added on the first launch and read back on
+//            every later one (the installer's keychain shim, or PlayChain)
+//   gl       which image dlsym(RTLD_DEFAULT, "glCreateShader") resolves to
+//            (the probe links OpenGL ES, so the installer adds its redirect)
 //
 // Built by test/make-probe-ipa.sh; no Xcode project.
 #import <UIKit/UIKit.h>
+#import <Security/Security.h>
+#import <OpenGLES/ES2/gl.h>
+#include <dlfcn.h>
 #include <sys/sysctl.h>
 
 static NSString *logPath;
@@ -47,6 +54,35 @@ static NSString *sysctlString(const char *name) {
   NSString *s = [NSString stringWithUTF8String:buf];
   free(buf);
   return s ?: @"?";
+}
+
+// One generic password: read it back if an earlier launch stored it, else
+// store one. A keychain that does not persist logs "add" on every launch.
+static void keychainRoundTrip(void) {
+  NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                          (__bridge id)kSecAttrService: @"ipa-probe", (__bridge id)kSecAttrAccount: @"probe",
+                          (__bridge id)kSecReturnData: @YES};
+  CFTypeRef result = NULL;
+  OSStatus rc = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+  if (rc == errSecSuccess && result) {
+    NSString *v = [[NSString alloc] initWithData:(__bridge_transfer NSData *)result encoding:NSUTF8StringEncoding];
+    plog(@"keychain read=%@", v);
+    return;
+  }
+  NSString *value = [NSString stringWithFormat:@"v-%.0f", NSDate.date.timeIntervalSince1970];
+  NSDictionary *item = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecAttrService: @"ipa-probe", (__bridge id)kSecAttrAccount: @"probe",
+                         (__bridge id)kSecValueData: [value dataUsingEncoding:NSUTF8StringEncoding]};
+  plog(@"keychain miss=%d add=%d value=%@", (int)rc, (int)SecItemAdd((__bridge CFDictionaryRef)item, NULL), value);
+}
+
+static void glLookup(void) {
+  Dl_info info = {0};
+  void *p = dlsym(RTLD_DEFAULT, "glCreateShader");
+  const char *img = (p && dladdr(p, &info) && info.dli_fname) ? strrchr(info.dli_fname, '/') + 1 : "none";
+  // glGetError keeps the OpenGL ES link: the installer adds its redirect
+  // only to apps that link it.
+  plog(@"gl lookup=%s linked=%p", img, (void *)glGetError);
 }
 
 @interface ProbeView : UIView
@@ -175,6 +211,8 @@ static NSString *sysctlString(const char *name) {
   NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
   [NSFileManager.defaultManager createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:NULL];
   logPath = [docs stringByAppendingPathComponent:@"probe.log"];
+  keychainRoundTrip();
+  glLookup();
   return YES;
 }
 - (UISceneConfiguration *)application:(UIApplication *)app
