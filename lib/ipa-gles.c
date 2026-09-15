@@ -32,7 +32,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
-#include <string.h>
+#include <stdbool.h>
 
 #define DYLD_INTERPOSE(_replacement, _replacee) \
     __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
@@ -58,22 +58,22 @@ static void *real_dlsym(void *handle, const char *name) {
     return dlsym(handle, name);
 }
 
-static void *gles_lookup(const char *name, int *handled) {
-    *handled = 0;
+// True when this lookup is one iOS would have answered on its own, with the
+// answer in *found: OpenGL ES's symbol, or NULL for an entry point that only
+// desktop GL has and iOS never did. False means "not ours, ask the real dlsym".
+static bool gles_answers(const char *name, void **found) {
+    *found = NULL;
     pthread_once(&g_once, open_libraries);
-    if (!g_gles) return NULL;
+    if (!g_gles) return false;
     void *p = real_dlsym(g_gles, name);
-    if (p) { *handled = 1; return p; }
-    // A desktop-only GL entry point: iOS would not have found it.
-    if (g_desktop && real_dlsym(g_desktop, name)) { *handled = 1; return NULL; }
-    return NULL;
+    if (p) { *found = p; return true; }
+    return g_desktop && real_dlsym(g_desktop, name);
 }
 
 static void *ipa_dlsym(void *handle, const char *name) {
     if (handle == RTLD_DEFAULT && name && name[0] == 'g' && name[1] == 'l') {
-        int handled;
-        void *p = gles_lookup(name, &handled);
-        if (handled) return p;
+        void *found;
+        if (gles_answers(name, &found)) return found;
     }
     __attribute__((musttail)) return dlsym(handle, name);
 }

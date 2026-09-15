@@ -52,6 +52,8 @@ ROOT="${IPA_INSTALL_CACHE:-$HOME/Library/Caches/ipa-install-on-mac}"
 DIR="$ROOT/playtools-$REV"
 OUT="$DIR/PlayTools.framework"
 
+# A complete build, not just a directory: an interrupted one leaves both the
+# marker missing and the framework half-copied.
 built() { [ -f "$DIR/built" ] && [ -f "$OUT/PlayTools" ] && [ -d "$OUT/PlugIns/AKInterface.bundle" ]; }
 if built; then echo "$OUT"; exit 0; fi
 
@@ -73,6 +75,7 @@ until mkdir "$LOCK" 2>/dev/null; do
   sleep 1; waited=$((waited + 1))
 done
 trap 'rm -rf "$LOCK"' EXIT
+# Again: the build this waited for is the one that was needed.
 if built; then echo "$OUT"; exit 0; fi
 
 echo "Building PlayTools ${REV:0:7} from source (first use on this Mac, about a minute; log: $DIR/build.log) ..." >&2
@@ -94,9 +97,10 @@ if ! xcodebuild -project "$DIR/src/PlayTools.xcodeproj" -scheme PlayTools -confi
   grep -E ': error: |^error: ' "$DIR/build.log" | sort -u | head -5 >&2 || true
   die "xcodebuild failed; the full log is $DIR/build.log"
 fi
-P="$DIR/dd/Build/Products/Release-iphoneos/PlayTools.framework"
-[ -f "$P/PlayTools" ] && [ -d "$P/PlugIns/AKInterface.bundle" ] || die "the build finished but $P is incomplete"
-cp -R "$P" "$OUT.tmp"
+PRODUCT="$DIR/dd/Build/Products/Release-iphoneos/PlayTools.framework"
+[ -f "$PRODUCT/PlayTools" ] && [ -d "$PRODUCT/PlugIns/AKInterface.bundle" ] || die "the build finished but $PRODUCT is incomplete"
+# Copied aside, then renamed: another install never sees a half-copied result.
+cp -R "$PRODUCT" "$OUT.tmp"
 mv "$OUT.tmp" "$OUT"
 # Derived data and the Swift package checkouts are only needed to build.
 rm -rf "$DIR/dd"
