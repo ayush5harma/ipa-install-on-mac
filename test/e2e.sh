@@ -9,7 +9,8 @@
 #   default     shipped idiom, the binary's own SDK kept, sandboxed, the
 #               embedded framework loads, dlsym(RTLD_DEFAULT, "gl...") answers
 #               OpenGL ES, and a keychain item survives a relaunch (the shim)
-#   mac idiom   --mac-idiom runs the app in the Mac idiom
+#   mac idiom   --mac-idiom runs the app in the Mac idiom, and a --dylib
+#               source (test/extra.c) is built, linked and loads
 #   playtools   --resolution 1080p forces a 1920x1080 screen, the device model
 #               reads iPad13,8, --map K=0.25,0.75 turns a K key press into a
 #               touch at exactly that fraction of the window, and a keychain
@@ -86,9 +87,15 @@ else
   bad "the probe did not relaunch"
 fi
 
-echo "--mac-idiom install"
-install --mac-idiom
-if launch; then check "Mac idiom (5)" logged ' launch idiom=5 '; else bad "the probe did not launch"; fi
+echo "--mac-idiom and --dylib install"
+install --mac-idiom --dylib "$HERE/extra.c"
+check "summary names the extra library" grep -q 'libextra.dylib (--dylib)' "$W/out"
+if launch; then
+  check "Mac idiom (5)" logged ' launch idiom=5 '
+  check "the --dylib source was built, linked and loaded" logged 'extra dylib loaded'
+else
+  bad "the probe did not launch"
+fi
 
 echo "--playtools install"
 rm -f "$PC/PlayChain/$BID.db"

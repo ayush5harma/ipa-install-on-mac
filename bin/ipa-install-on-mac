@@ -77,6 +77,8 @@ Install options:
   --reset           clear the app'"'"'s sandbox container and emulated keychain first
   --playtools       embed PlayTools (keyboard/mouse mapping, resolution control);
                     implied by every option below
+  --dylib FILE      also link FILE into the app: a .c/.m source (built for Mac
+                    Catalyst against the macOS SDK) or a .dylib; repeatable
 
 PlayTools options (install, or --configure an installed app):
   --resolution R    auto | 1080p | 1440p | 4k | WIDTHxHEIGHT | resizable | app-default
@@ -106,6 +108,7 @@ warn() { echo "ipa-install-on-mac: warning: $*" >&2; }
 IPA=""; DEST="/Applications"; OPEN=0; FORCE=0; KEEP=0; SCALED=0; KEYCHAIN=1; RESET=0
 PLAYTOOLS=0; MAC_IDIOM=0; CONFIGURE=""; INSTALL_ONLY=""
 PT_ARGS=()   # handed to lib/playtools-config.py as given
+EXTRA=()     # --dylib files, absolute paths
 while [ $# -gt 0 ]; do
   case "$1" in
     --dest)  [ $# -ge 2 ] || usage; DEST="$2"; INSTALL_ONLY="$1"; shift 2 ;;
@@ -118,6 +121,11 @@ while [ $# -gt 0 ]; do
     --playtools)   PLAYTOOLS=1; INSTALL_ONLY="$1"; shift ;;
     --mac-idiom)   MAC_IDIOM=1; INSTALL_ONLY="$1"; shift ;;
     --configure)   [ $# -ge 2 ] || usage; CONFIGURE="$2"; shift 2 ;;
+    --dylib)
+      [ $# -ge 2 ] || usage
+      [ -f "$2" ] || die "--dylib: no such file: $2"
+      case "$2" in *.c|*.m|*.dylib) ;; *) die "--dylib takes a .c, .m or .dylib file: $2" ;; esac
+      EXTRA+=("$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"); INSTALL_ONLY="$1"; shift 2 ;;
     --resolution|--aspect|--map|--drag|--joystick|--mouse-look|--set)
       [ $# -ge 2 ] || usage; PT_ARGS+=("$1" "$2"); PLAYTOOLS=1; shift 2 ;;
     --keymap)
@@ -239,6 +247,7 @@ if [ "$SHIM" -eq 1 ] || [ "$CHAIN" -eq 1 ] || [ "$PLAYTOOLS" -eq 1 ]; then
   SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode or pass --no-keychain"
 fi
 [ "$SHIM" -eq 0 ] || need_lib ipa-keychain.c ipa-inject-dylib.py
+[ ${#EXTRA[@]} -eq 0 ] || need_lib ipa-inject-dylib.py
 [ "$PLAYTOOLS" -eq 0 ] || need_lib ipa-inject-dylib.py playtools-build.sh playtools/Package.resolved
 
 # ── Unpack ──────────────────────────────────────────────────────────────────
@@ -517,6 +526,35 @@ if grep -F '/OpenGLES.framework/' "$WORK/linked" >/dev/null; then
   GLES_NOTE="links OpenGL ES: run-time GL lookups answered by OpenGL ES, not desktop GL (libipagles)"
 fi
 
+# ── Extra libraries (--dylib) ─────────────────────────────────────────────
+# App-specific code linked into the main executable the same way as the
+# shims: a source is built for Mac Catalyst against the macOS SDK (it may use
+# Foundation and the Objective-C runtime), a prebuilt dylib is converted like
+# every other Mach-O. Linked last, so it loads after the app's own libraries
+# and can find their exported symbols with dlsym.
+for src in ${EXTRA[@]+"${EXTRA[@]}"}; do
+  base=$(basename "$src"); base=${base%.*}
+  case "$base" in *[!A-Za-z0-9._-]*) die "--dylib: use a file name of letters, digits, . _ -: $base" ;; esac
+  lib="$APP/Frameworks/lib$base.dylib"
+  mkdir -p "$APP/Frameworks"
+  case "$src" in
+    *.dylib)
+      cp "$src" "$lib"
+      convert_macho "$lib" ;;
+    *)
+      [ -n "${SDK:-}" ] || SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode"
+      xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -O2 -fobjc-arc -dynamiclib \
+        -framework Foundation -framework CoreFoundation \
+        -install_name "@executable_path/Frameworks/lib$base.dylib" \
+        -o "$lib" "$src" 2>"$WORK/clang.err" \
+        || die "could not build $(basename "$src"): $(tr '\n' ' ' < "$WORK/clang.err")" ;;
+  esac
+  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" "@executable_path/Frameworks/lib$base.dylib" >/dev/null 2>"$WORK/inject.err" \
+    || die "could not link lib$base.dylib into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
+  printf '%s\n' "$lib" >> "$MACHOS"
+  EXTRA_NOTE="${EXTRA_NOTE:+$EXTRA_NOTE, }lib$base.dylib"
+done
+
 # ── Sign ────────────────────────────────────────────────────────────────────
 # PlayCover's base set: sandboxed (so the app gets its own container instead
 # of writing into ~/Documents), with the capability entitlements that let a
@@ -687,6 +725,7 @@ fi
 echo "  rendering: $RENDER"
 echo "  keychain:  $KEYCHAIN_NOTE"
 [ -z "$GLES_NOTE" ] || echo "  opengl es: $GLES_NOTE"
+[ -z "${EXTRA_NOTE:-}" ] || echo "  linked:    $EXTRA_NOTE (--dylib)"
 [ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
 if [ "$PLAYTOOLS" -eq 1 ]; then
   echo "  playtools: ${PT_REV:0:7}, embedded; settings in $(tilde "$PC_DIR")"

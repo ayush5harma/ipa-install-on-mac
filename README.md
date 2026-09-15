@@ -81,6 +81,7 @@ ipa-install-on-mac --configure <App.app | bundle id> [PlayTools options] [--open
 | `--no-keychain` | no emulated keychain; logins will not survive a relaunch |
 | `--reset` | wipe the app's sandbox container (preferences, caches, the emulated keychain) before installing |
 | `--playtools` | embed PlayTools; implied by every option in the next table |
+| `--dylib FILE` | also link `FILE` into the app: a `.c`/`.m` source, built for Mac Catalyst against the macOS SDK (Foundation available), or a prebuilt `.dylib`, converted like the rest; repeatable. It loads after the app's own libraries, so it can `dlsym` what they export |
 | `-h`, `--help` | print usage and exit 0 |
 
 PlayTools options, at install time or later through `--configure`:
@@ -352,8 +353,8 @@ launch's own marker: a default install (shipped idiom, own SDK kept,
 sandboxed, a GL lookup answered by OpenGL ES, a keychain item surviving a
 relaunch), `--mac-idiom`, a `--playtools` install (forced resolution,
 spoofed model, a mapped key becoming a touch, PlayChain surviving a
-relaunch, sandbox rules naming only this app) and a `--configure` change
-taking effect on relaunch — 19 checks, green with stock bash 3.2 and
+relaunch, sandbox rules naming only this app), `--mac-idiom` with a `--dylib` source that loads, and a `--configure` change
+taking effect on relaunch — 21 checks, green with stock bash 3.2 and
 Python 3.9 as well. The key press goes through
 System Events, so the terminal needs Accessibility. It needs Xcode's iOS SDK
 and, for the PlayTools part, the one-time PlayTools build.
