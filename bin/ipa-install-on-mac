@@ -104,6 +104,36 @@ die()  { echo "ipa-install-on-mac: $*" >&2; exit 2; }
 # ~ for $HOME in messages; ${var/#$HOME/\~} prints a literal \~ on bash 3.2.
 tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
 warn() { echo "ipa-install-on-mac: warning: $*" >&2; }
+# A captured stderr file on one line, so a tool's multi-line complaint still
+# reads as one message.
+oneline() { tr '\n' ' ' < "$1"; }
+# One Info.plist value, empty when it is not there: a key this asks for is
+# usually optional, and an ipa is untrusted input.
+plist_get() { plutil -extract "$2" raw -o - "$1" 2>/dev/null || true; }
+# Absolute, without resolving symlinks: --dylib names the library it builds
+# after this file, so following a link here would rename it.
+abs_path() { printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")"; }
+# Reverse-DNS, and nothing else: a bundle id becomes a path below (the
+# --reset container wipe, PlayTools' settings), and an ipa is untrusted
+# input, so "../../Documents" must be refused before it is interpolated.
+check_bundle_id() {
+  case "$1" in
+    ""|*/*|*..*|*[!A-Za-z0-9._-]*) die "implausible bundle id: $1" ;;
+  esac
+}
+# Is exactly this executable running? ps -o comm= prints the full path.
+running_exe() { ps -axo comm= | grep -Fx "$1" >/dev/null; }
+# The macOS SDK, resolved once and kept: every dylib this tool builds is
+# compiled against it. $1 says what to do about it, which depends on why it
+# was needed (the keychain shim can be skipped, the OpenGL ES one cannot).
+need_sdk() {
+  [ -n "${SDK:-}" ] || SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) \
+    || die "no macOS SDK (xcrun --sdk macosx); $1"
+}
+# Version order, for the two versions that are compared here (each binary's
+# SDK, and MinimumOSVersion); sort -V, because 14.10 is above 14.9.
+lowest_version()  { printf '%s\n' "$@" | sort -V | head -1; }
+highest_version() { printf '%s\n' "$@" | sort -V | tail -1; }
 
 IPA=""; DEST="/Applications"; OPEN=0; FORCE=0; KEEP=0; SCALED=0; KEYCHAIN=1; RESET=0
 PLAYTOOLS=0; MAC_IDIOM=0; CONFIGURE=""; INSTALL_ONLY=""
@@ -125,13 +155,13 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || usage
       [ -f "$2" ] || die "--dylib: no such file: $2"
       case "$2" in *.c|*.m|*.dylib) ;; *) die "--dylib takes a .c, .m or .dylib file: $2" ;; esac
-      EXTRA+=("$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"); INSTALL_ONLY="$1"; shift 2 ;;
+      EXTRA+=("$(abs_path "$2")"); INSTALL_ONLY="$1"; shift 2 ;;
     --resolution|--aspect|--map|--drag|--joystick|--mouse-look|--set)
       [ $# -ge 2 ] || usage; PT_ARGS+=("$1" "$2"); PLAYTOOLS=1; shift 2 ;;
     --keymap)
       [ $# -ge 2 ] || usage
       [ -f "$2" ] || die "--keymap: no such file: $2"
-      PT_ARGS+=("$1" "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"); PLAYTOOLS=1; shift 2 ;;
+      PT_ARGS+=("$1" "$(abs_path "$2")"); PLAYTOOLS=1; shift 2 ;;
     -h|--help) help ;;
     -*) usage ;;
     *) [ -z "$IPA" ] || usage; IPA="$1"; shift ;;
@@ -196,42 +226,54 @@ if [ "$PLAYTOOLS" -eq 1 ] || [ -n "$CONFIGURE" ]; then
 fi
 
 # ── --configure: settings and keymap only, for an app already installed ────
-if [ -n "$CONFIGURE" ]; then
-  APPPATH=""; BID=""
-  if [ -d "$CONFIGURE" ]; then
-    APPPATH="$(cd "$CONFIGURE" && pwd)"
-    BID=$(plutil -extract CFBundleIdentifier raw -o - "$APPPATH/Info.plist" 2>/dev/null || true)
-    [ -n "$BID" ] || die "$CONFIGURE has no Info.plist with a CFBundleIdentifier"
-  else
-    BID="$CONFIGURE"
-    for d in /Applications "$HOME/Applications"; do
-      for a in "$d"/*.app; do
-        [ -f "$a/Info.plist" ] || continue
-        if [ "$(plutil -extract CFBundleIdentifier raw -o - "$a/Info.plist" 2>/dev/null || true)" = "$BID" ]; then
-          APPPATH="$a"; break 2
-        fi
-      done
+# Where an installed app with this bundle id is, if it is anywhere this can
+# see: only the two directories a user installs into. Empty is not an error --
+# the settings are PlayCover's, not the bundle's, and can be written before
+# the app exists.
+installed_app_with_id() {
+  local dir app
+  for dir in /Applications "$HOME/Applications"; do
+    for app in "$dir"/*.app; do
+      [ -f "$app/Info.plist" ] || continue
+      if [ "$(plist_get "$app/Info.plist" CFBundleIdentifier)" = "$1" ]; then
+        printf '%s\n' "$app"
+        return 0
+      fi
     done
+  done
+  return 0
+}
+
+configure_installed_app() {
+  local app_path="" bid="" exe running=0
+  if [ -d "$CONFIGURE" ]; then
+    app_path="$(cd "$CONFIGURE" && pwd)"
+    bid=$(plist_get "$app_path/Info.plist" CFBundleIdentifier)
+    [ -n "$bid" ] || die "$CONFIGURE has no Info.plist with a CFBundleIdentifier"
+  else
+    bid="$CONFIGURE"
+    app_path=$(installed_app_with_id "$bid")
   fi
-  case "$BID" in
-    ""|*/*|*..*|*[!A-Za-z0-9._-]*) die "implausible bundle id: $BID" ;;
-  esac
-  [ -n "$APPPATH" ] || warn "no installed app with bundle id $BID in /Applications or ~/Applications; writing its settings anyway -- check the id"
-  RUNNING=0
-  if [ -n "$APPPATH" ]; then
-    EXE=$(plutil -extract CFBundleExecutable raw -o - "$APPPATH/Info.plist" 2>/dev/null || true)
-    if ! otool -L "$APPPATH/$EXE" 2>/dev/null | grep -F 'PlayTools.framework/PlayTools' >/dev/null; then
-      warn "$APPPATH has no PlayTools linked (installed without --playtools?); these settings apply once it is reinstalled with --playtools"
+  check_bundle_id "$bid"
+  [ -n "$app_path" ] || warn "no installed app with bundle id $bid in /Applications or ~/Applications; writing its settings anyway -- check the id"
+  if [ -n "$app_path" ]; then
+    exe=$(plist_get "$app_path/Info.plist" CFBundleExecutable)
+    if ! otool -L "$app_path/$exe" 2>/dev/null | grep -F 'PlayTools.framework/PlayTools' >/dev/null; then
+      warn "$app_path has no PlayTools linked (installed without --playtools?); these settings apply once it is reinstalled with --playtools"
     fi
-    ps -axo comm= | grep -Fx "$APPPATH/$EXE" >/dev/null && RUNNING=1
+    running_exe "$app_path/$exe" && running=1
   fi
-  echo "PlayTools settings for $BID${APPPATH:+ ($APPPATH)}:"
-  python3 "$LIB_DIR/playtools-config.py" --bundle-id "$BID" ${PT_ARGS[@]+"${PT_ARGS[@]}"} | sed 's/^/  /'
-  if [ "$RUNNING" -eq 1 ]; then
+  echo "PlayTools settings for $bid${app_path:+ ($app_path)}:"
+  python3 "$LIB_DIR/playtools-config.py" --bundle-id "$bid" ${PT_ARGS[@]+"${PT_ARGS[@]}"} | sed 's/^/  /'
+  # PlayTools reads both files once, at launch, so a running app is told.
+  if [ "$running" -eq 1 ]; then
     echo "It is running: quit it (Cmd+Q) and open it again for these to apply; PlayTools reads them at launch."
-  elif [ "$OPEN" -eq 1 ] && [ -n "$APPPATH" ]; then
-    open "$APPPATH" && echo "Launched $APPPATH"
+  elif [ "$OPEN" -eq 1 ] && [ -n "$app_path" ]; then
+    open "$app_path" && echo "Launched $app_path"
   fi
+}
+if [ -n "$CONFIGURE" ]; then
+  configure_installed_app
   exit 0
 fi
 
@@ -241,7 +283,8 @@ done
 for t in lipo otool vtool install_name_tool; do
   xcrun -f "$t" >/dev/null 2>&1 || die "missing $t: install Xcode or the Command Line Tools (xcode-select --install)"
 done
-LIPO=$(xcrun -f lipo); OTOOL=$(xcrun -f otool); VTOOL=$(xcrun -f vtool); INT=$(xcrun -f install_name_tool)
+LIPO=$(xcrun -f lipo); OTOOL=$(xcrun -f otool); VTOOL=$(xcrun -f vtool)
+INSTALL_NAME_TOOL=$(xcrun -f install_name_tool)
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 if [ "$SHIM" -eq 1 ] || [ "$CHAIN" -eq 1 ] || [ "$PLAYTOOLS" -eq 1 ]; then
   SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode or pass --no-keychain"
@@ -273,27 +316,22 @@ done
 
 PLIST="$APP/Info.plist"
 [ -f "$PLIST" ] || die "no Info.plist in $(basename "$APP")"
-pl() { plutil -extract "$1" raw -o - "$PLIST" 2>/dev/null || true; }
-EXE=$(pl CFBundleExecutable);   [ -n "$EXE" ] || die "Info.plist has no CFBundleExecutable"
-BID=$(pl CFBundleIdentifier);   [ -n "$BID" ] || die "Info.plist has no CFBundleIdentifier"
-# BID becomes a filesystem path twice below (the --reset container wipe, and
-# every install's container note) -- an ipa is untrusted input, so a crafted
-# CFBundleIdentifier such as "../../Documents" must be refused HERE, before
-# it is ever interpolated into a path a later `find` or `rm -rf` could touch.
-# Real bundle ids are reverse-DNS: letters, digits, dots and hyphens only.
-case "$BID" in
-  ""|*/*|*..*|*[!A-Za-z0-9._-]*) die "implausible bundle id: $BID" ;;
-esac
-# Same for the executable's name: it is chmod'ed and has load commands
-# injected, so "../../.ssh/id_ed25519" must never be a path this reaches.
+EXE=$(plist_get "$PLIST" CFBundleExecutable); [ -n "$EXE" ] || die "Info.plist has no CFBundleExecutable"
+BID=$(plist_get "$PLIST" CFBundleIdentifier); [ -n "$BID" ] || die "Info.plist has no CFBundleIdentifier"
+# Both become paths below, before anything has been checked for sanity: the
+# id in the --reset container wipe and in every install's container note, the
+# executable's name in a chmod and in the load commands injected into it.
+check_bundle_id "$BID"
 case "$EXE" in
   */*|.|..) die "implausible executable name: $EXE" ;;
 esac
-NAME=$(pl CFBundleDisplayName); [ -n "$NAME" ] || NAME=$(pl CFBundleName); [ -n "$NAME" ] || NAME="$EXE"
-NAME=$(printf '%s' "$NAME" | tr '/:' '__')
-MINOS=$(pl MinimumOSVersion)
+NAME=$(plist_get "$PLIST" CFBundleDisplayName)
+[ -n "$NAME" ] || NAME=$(plist_get "$PLIST" CFBundleName)
+[ -n "$NAME" ] || NAME="$EXE"
+NAME=$(printf '%s' "$NAME" | tr '/:' '__')   # the installed bundle is named after it
+MIN_OS=$(plist_get "$PLIST" MinimumOSVersion)
 [ -f "$APP/$EXE" ] || die "executable $EXE not found in the bundle"
-echo "  $NAME ($BID), executable $EXE, iOS ${MINOS:-?}+"
+echo "  $NAME ($BID), executable $EXE, iOS ${MIN_OS:-?}+"
 
 # --reset must refuse before ANYTHING else happens, not just before the
 # container is cleared: the previous copy at $DEST/$NAME.app is moved to
@@ -304,6 +342,29 @@ echo "  $NAME ($BID), executable $EXE, iOS ${MINOS:-?}+"
 if [ "$RESET" -eq 1 ] && ps -axo comm= | grep -F "/$NAME.app/" >/dev/null; then
   die "--reset needs the app quit first: a running $NAME would write its state straight back"
 fi
+
+# ── Building and linking what the app needs ────────────────────────────────
+# Everything this tool adds to an app is a dylib built for Mac Catalyst
+# against the macOS SDK -- the same target the bundle's own binaries are
+# converted to -- and linked into the main executable, because an interposing
+# library only works when it is loaded at launch.
+#   $1 the file to write, $2 the install name, $3 the source, $4 what to say
+#   if clang fails, and then any flags this particular library needs.
+catalyst_dylib() {
+  local out="$1" install_name="$2" src="$3" what="$4"
+  shift 4
+  xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" ${1+"$@"} -dynamiclib \
+    -install_name "$install_name" -o "$out" "$src" 2>"$WORK/clang.err" \
+    || die "$what: $(oneline "$WORK/clang.err")"
+}
+# Add the load command, and have the file signed with the rest of the bundle
+# ($MACHOS is what the signing loop reads).
+#   $1 the file, $2 the install name the app loads it by, $3 what to call it.
+link_into_app() {
+  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" "$2" >/dev/null 2>"$WORK/inject.err" \
+    || die "could not link $3 into $EXE: $(oneline "$WORK/inject.err")"
+  printf '%s\n' "$1" >> "$MACHOS"
+}
 
 # ── Keychain-fix tweaks: neutralised, the shim is the keychain now ──────────
 # See README.md's "Measured traps": a sideloading tweak that hooks
@@ -318,11 +379,10 @@ if [ "$SHIM" -eq 1 ] || [ "$CHAIN" -eq 1 ]; then
   printf 'void ipa_neutralised(void) {}\n' > "$WORK/noop.c"
   while IFS= read -r f; do
     [ -f "$f" ] || continue
+    # Keep its install name, whatever it is: that is the name dyld looks up.
     oldid=$("$OTOOL" -D "$f" 2>/dev/null | sed -n '2p')
     [ -n "$oldid" ] || continue
-    xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -dynamiclib -install_name "$oldid" \
-      -o "$f" "$WORK/noop.c" 2>"$WORK/noop.err" \
-      || die "could not neutralise ${f#"$APP"/}: $(tr '\n' ' ' < "$WORK/noop.err")"
+    catalyst_dylib "$f" "$oldid" "$WORK/noop.c" "could not neutralise ${f#"$APP"/}"
     NEUTRALISED="$NEUTRALISED ${f#"$APP"/}"
   done < <(find "$APP" -type f -iname '*.dylib' | grep -iE 'keychain.?fix|sideload.?keychain' || true)
   [ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
@@ -365,52 +425,61 @@ fi
 # about a minute and needs the network) -- only now, so an ipa refused above
 # never costs a build.
 if [ "$PLAYTOOLS" -eq 1 ]; then
-  PT_SRC=$("$LIB_DIR/playtools-build.sh") || die "could not build PlayTools (see above)"
+  PT_BUILD=$("$LIB_DIR/playtools-build.sh") || die "could not build PlayTools (see above)"
   PT_REV=$("$LIB_DIR/playtools-build.sh" --rev)
 fi
 
 # ── Convert: arm64 only, Mac Catalyst platform, system Swift UIKit overlay ──
-convert_macho() {
+# Thin a fat binary down to its plain arm64 slice, refusing anything this tool
+# has not been exercised on. arm64e (pointer authentication) is a slice of its
+# own, and `lipo -thin arm64` on an arm64e-only binary is a no-op that would
+# carry an untested arch through vtool and codesign, so it is refused instead.
+thin_to_arm64() {
   local f="$1" archs
   archs=$("$LIPO" -archs "$f" 2>/dev/null || true)
   case " $archs " in
-    *" arm64 "*|*" arm64e "*) ;;
-    *) die "no arm64 slice in ${f#"$APP"/} (archs: ${archs:-unknown})" ;;
-  esac
-  # arm64e (pointer authentication) is a distinct slice from plain arm64, and
-  # thinning to "arm64" below is a no-op when arm64e is the ONLY slice present
-  # -- this tool has only been exercised against a plain arm64 slice, so
-  # refuse rather than silently carry an untested arch through vtool and
-  # codesign.
-  case " $archs " in
     *" arm64 "*) ;;
-    *) die "${f#"$APP"/} has only an arm64e slice (archs: $archs); this tool needs a plain arm64 slice -- ask upstream for one, or --keep and convert it by hand" ;;
+    *" arm64e "*) die "${f#"$APP"/} has only an arm64e slice (archs: $archs); this tool needs a plain arm64 slice -- ask upstream for one, or --keep and convert it by hand" ;;
+    *) die "no arm64 slice in ${f#"$APP"/} (archs: ${archs:-unknown})" ;;
   esac
   if [ "$(printf '%s\n' "$archs" | wc -w)" -gt 1 ]; then
     "$LIPO" -thin arm64 -output "$f.thin" "$f" && mv -f "$f.thin" "$f" || die "lipo -thin failed on ${f#"$APP"/}"
   fi
-  # PlayCover's minimum (11.0), so LaunchServices treats the bundle as a
-  # Catalyst app, which an ad-hoc signature is allowed to launch -- but the
-  # binary's OWN SDK version, not PlayCover's 14.0. UIKit and SwiftUI switch
-  # behaviour on the SDK an app was linked against ("linked on or after"), and
-  # a Catalyst build version counts in iOS versions, so 14.0 told a 2026 app it
-  # was built for iOS 14: Google Photos 7.92 (SDK 26.4) then showed no photo
-  # grid, no Videos or Creations, and its Recently Added grid laid itself out
-  # at zero width forever, the main thread pinned in SwiftUI (measured
-  # 2026-09-16; with its own 26.4 every one of them renders).
+}
+
+# The SDK version to stamp on a binary: its OWN, never below PlayCover's 14.0.
+# UIKit and SwiftUI switch behaviour on the SDK an app was linked against
+# ("linked on or after"), and a Catalyst build version counts in iOS versions,
+# so PlayCover's fixed 14.0 told a 2026 app it was built for iOS 14: Google
+# Photos 7.92 (SDK 26.4) then showed no photo grid, no Videos or Creations,
+# and its Recently Added grid laid itself out at zero width forever, the main
+# thread pinned in SwiftUI (measured 2026-09-16; with its own 26.4 every one
+# of them renders).
+sdk_version_of() {
   local sdk
-  sdk=$("$OTOOL" -l "$f" 2>/dev/null | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS/ { c = 1 } c && $1 == "sdk" && !d { print $2; d = 1 }' || true)
+  sdk=$("$OTOOL" -l "$1" 2>/dev/null | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS/ { c = 1 } c && $1 == "sdk" && !d { print $2; d = 1 }' || true)
   case "$sdk" in
-    [0-9]*.[0-9]*) [ "$(printf '%s\n14.0\n' "$sdk" | sort -V | head -1)" = "14.0" ] || sdk=14.0 ;;
+    [0-9]*.[0-9]*) [ "$(lowest_version "$sdk" 14.0)" = "14.0" ] || sdk=14.0 ;;
     *) sdk=14.0 ;;
   esac
+  printf '%s\n' "$sdk"
+}
+
+# One Mach-O, in place: thinned, its platform rewritten to Mac Catalyst at
+# PlayCover's minimum 11.0 (what lets LaunchServices treat the bundle as a
+# Catalyst app, which an ad-hoc signature is allowed to launch), and the one
+# iOS-specific Swift overlay repointed at the system's copy.
+convert_macho() {
+  local f="$1" sdk
+  thin_to_arm64 "$f"
+  sdk=$(sdk_version_of "$f")
   "$VTOOL" -set-build-version maccatalyst 11.0 "$sdk" -replace -output "$f.vt" "$f" >/dev/null 2>"$WORK/vtool.err" \
     && mv -f "$f.vt" "$f" \
-    || die "vtool could not rewrite the platform of ${f#"$APP"/}: $(tr '\n' ' ' < "$WORK/vtool.err")"
+    || die "vtool could not rewrite the platform of ${f#"$APP"/}: $(oneline "$WORK/vtool.err")"
   # /usr/lib/swift has no UIKit overlay on macOS; Catalyst's copy lives under
   # /System/iOSSupport. Only this one overlay is iOS-specific.
   if "$OTOOL" -L "$f" 2>/dev/null | grep '@rpath/libswiftUIKit\.dylib' >/dev/null; then
-    "$INT" -change @rpath/libswiftUIKit.dylib /System/iOSSupport/usr/lib/swift/libswiftUIKit.dylib "$f" 2>/dev/null \
+    "$INSTALL_NAME_TOOL" -change @rpath/libswiftUIKit.dylib /System/iOSSupport/usr/lib/swift/libswiftUIKit.dylib "$f" 2>/dev/null \
       || warn "could not repoint libswiftUIKit in ${f#"$APP"/}; the app may fail to launch"
   fi
 }
@@ -424,7 +493,7 @@ rm -f "$APP/embedded.mobileprovision"
 
 # LaunchServices reads MinimumOSVersion as a system requirement once the
 # platform says Catalyst; an iOS 17 app would otherwise "need macOS 17".
-if [ -n "$MINOS" ] && [ "$(printf '%s\n11.0\n' "$MINOS" | sort -V | tail -1)" != "11.0" ]; then
+if [ -n "$MIN_OS" ] && [ "$(highest_version "$MIN_OS" 11.0)" != "11.0" ]; then
   plutil -replace MinimumOSVersion -string 11.0 "$PLIST" >/dev/null
 fi
 
@@ -455,44 +524,38 @@ fi
 # PlugIns/, which is where AKInterface.bundle goes. AKInterface is a native
 # macOS bundle and stays one: signed below, never converted.
 if [ "$PLAYTOOLS" -eq 1 ]; then
-  PTD="$APP/Frameworks/PlayTools.framework"
-  AKI="$APP/PlugIns/AKInterface.bundle"
+  PT_FRAMEWORK="$APP/Frameworks/PlayTools.framework"
+  AK_BUNDLE="$APP/PlugIns/AKInterface.bundle"
   mkdir -p "$APP/Frameworks" "$APP/PlugIns"
-  rm -rf "$PTD" "$AKI"
-  cp -R "$PT_SRC" "$PTD"
-  mv "$PTD/PlugIns/AKInterface.bundle" "$AKI"
-  rm -rf "$PTD/PlugIns" "$PTD/Headers" "$PTD/Modules"
+  rm -rf "$PT_FRAMEWORK" "$AK_BUNDLE"
+  cp -R "$PT_BUILD" "$PT_FRAMEWORK"
+  mv "$PT_FRAMEWORK/PlugIns/AKInterface.bundle" "$AK_BUNDLE"
+  rm -rf "$PT_FRAMEWORK/PlugIns" "$PT_FRAMEWORK/Headers" "$PT_FRAMEWORK/Modules"
   # Its toasts look their strings up in Bundle.main (table "Playtools"): into
   # the app's own lproj directories that match, en only when none do -- a new
   # lproj directory makes the whole app claim that localization.
   placed=0
-  for l in "$PTD"/*.lproj; do
+  for l in "$PT_FRAMEWORK"/*.lproj; do
     [ -f "$l/Playtools.strings" ] && [ -d "$APP/${l##*/}" ] || continue
     cp "$l/Playtools.strings" "$APP/${l##*/}/"; placed=1
   done
-  if [ "$placed" -eq 0 ] && [ -f "$PTD/en.lproj/Playtools.strings" ]; then
-    mkdir -p "$APP/en.lproj"; cp "$PTD/en.lproj/Playtools.strings" "$APP/en.lproj/"
+  if [ "$placed" -eq 0 ] && [ -f "$PT_FRAMEWORK/en.lproj/Playtools.strings" ]; then
+    mkdir -p "$APP/en.lproj"; cp "$PT_FRAMEWORK/en.lproj/Playtools.strings" "$APP/en.lproj/"
   fi
-  convert_macho "$PTD/PlayTools"
-  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" @executable_path/Frameworks/PlayTools.framework/PlayTools >/dev/null 2>"$WORK/inject.err" \
-    || die "could not link PlayTools into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
-  printf '%s\n' "$PTD/PlayTools" >> "$MACHOS"
+  convert_macho "$PT_FRAMEWORK/PlayTools"
+  link_into_app "$PT_FRAMEWORK/PlayTools" @executable_path/Frameworks/PlayTools.framework/PlayTools PlayTools
 elif [ -d "$APP/Frameworks/UnityFramework.framework" ]; then
   echo "  hint: this looks like a game (UnityFramework); --playtools adds keyboard and mouse mapping"
 fi
 
 # ── Keychain: the file-backed shim, linked into the main executable ─────────
 if [ "$SHIM" -eq 1 ]; then
-  SHIMLIB="$APP/Frameworks/libipakeychain.dylib"
+  SHIM_LIB="$APP/Frameworks/libipakeychain.dylib"
   mkdir -p "$APP/Frameworks"
-  xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -O2 -dynamiclib \
-    -framework CoreFoundation -framework Security \
-    -install_name @executable_path/Frameworks/libipakeychain.dylib \
-    -o "$SHIMLIB" "$LIB_DIR/ipa-keychain.c" 2>"$WORK/clang.err" \
-    || die "could not build the keychain shim: $(tr '\n' ' ' < "$WORK/clang.err")"
-  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" @executable_path/Frameworks/libipakeychain.dylib >/dev/null 2>"$WORK/inject.err" \
-    || die "could not link the keychain shim into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
-  printf '%s\n' "$SHIMLIB" >> "$MACHOS"
+  catalyst_dylib "$SHIM_LIB" @executable_path/Frameworks/libipakeychain.dylib \
+    "$LIB_DIR/ipa-keychain.c" "could not build the keychain shim" \
+    -O2 -framework CoreFoundation -framework Security
+  link_into_app "$SHIM_LIB" @executable_path/Frameworks/libipakeychain.dylib "the keychain shim"
   KEYCHAIN_NOTE="file-backed shim; items in the container under Library/Application Support/ipa-keychain"
 elif [ "$CHAIN" -eq 1 ]; then
   KEYCHAIN_NOTE="PlayChain, PlayTools' emulated keychain (items in $(tilde "$PC_DIR")/PlayChain/$BID.db)"
@@ -513,16 +576,12 @@ GLES_NOTE=""
 { tr '\n' '\0' < "$MACHOS" | xargs -0 "$OTOOL" -L; } > "$WORK/linked" 2>/dev/null || true
 if grep -F '/OpenGLES.framework/' "$WORK/linked" >/dev/null; then
   need_lib ipa-gles.c ipa-inject-dylib.py
-  [ -n "${SDK:-}" ] || SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode"
-  GLESLIB="$APP/Frameworks/libipagles.dylib"
+  need_sdk "install Xcode"
+  GLES_LIB="$APP/Frameworks/libipagles.dylib"
   mkdir -p "$APP/Frameworks"
-  xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -O2 -dynamiclib \
-    -install_name @executable_path/Frameworks/libipagles.dylib \
-    -o "$GLESLIB" "$LIB_DIR/ipa-gles.c" 2>"$WORK/clang.err" \
-    || die "could not build the OpenGL ES shim: $(tr '\n' ' ' < "$WORK/clang.err")"
-  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" @executable_path/Frameworks/libipagles.dylib >/dev/null 2>"$WORK/inject.err" \
-    || die "could not link the OpenGL ES shim into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
-  printf '%s\n' "$GLESLIB" >> "$MACHOS"
+  catalyst_dylib "$GLES_LIB" @executable_path/Frameworks/libipagles.dylib \
+    "$LIB_DIR/ipa-gles.c" "could not build the OpenGL ES shim" -O2
+  link_into_app "$GLES_LIB" @executable_path/Frameworks/libipagles.dylib "the OpenGL ES shim"
   GLES_NOTE="links OpenGL ES: run-time GL lookups answered by OpenGL ES, not desktop GL (libipagles)"
 fi
 
@@ -533,6 +592,7 @@ fi
 # every other Mach-O. Linked last, so it loads after the app's own libraries
 # and can find their exported symbols with dlsym.
 for src in ${EXTRA[@]+"${EXTRA[@]}"}; do
+  # The library is named after the file, so the name has to be a plain one.
   base=$(basename "$src"); base=${base%.*}
   case "$base" in *[!A-Za-z0-9._-]*) die "--dylib: use a file name of letters, digits, . _ -: $base" ;; esac
   lib="$APP/Frameworks/lib$base.dylib"
@@ -542,16 +602,12 @@ for src in ${EXTRA[@]+"${EXTRA[@]}"}; do
       cp "$src" "$lib"
       convert_macho "$lib" ;;
     *)
-      [ -n "${SDK:-}" ] || SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode"
-      xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -O2 -fobjc-arc -dynamiclib \
-        -framework Foundation -framework CoreFoundation \
-        -install_name "@executable_path/Frameworks/lib$base.dylib" \
-        -o "$lib" "$src" 2>"$WORK/clang.err" \
-        || die "could not build $(basename "$src"): $(tr '\n' ' ' < "$WORK/clang.err")" ;;
+      need_sdk "install Xcode"
+      catalyst_dylib "$lib" "@executable_path/Frameworks/lib$base.dylib" "$src" \
+        "could not build $(basename "$src")" \
+        -O2 -fobjc-arc -framework Foundation -framework CoreFoundation ;;
   esac
-  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" "@executable_path/Frameworks/lib$base.dylib" >/dev/null 2>"$WORK/inject.err" \
-    || die "could not link lib$base.dylib into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
-  printf '%s\n' "$lib" >> "$MACHOS"
+  link_into_app "$lib" "@executable_path/Frameworks/lib$base.dylib" "lib$base.dylib"
   EXTRA_NOTE="${EXTRA_NOTE:+$EXTRA_NOTE, }lib$base.dylib"
 done
 
@@ -599,15 +655,17 @@ if [ "$PLAYTOOLS" -eq 1 ]; then
 import plistlib, sys
 ents, pc, bid = sys.argv[1], sys.argv[2], sys.argv[3]
 chain = f"{pc}/PlayChain/{bid}.db"
+JAILBREAK_PROBES = ("/bin/bash", "/usr/sbin/sshd", "/usr/libexec/ssh-keysign", "/bin/sh",
+                    "/etc/ssh/sshd_config", "/usr/libexec/sftp-server", "/usr/bin/ssh")
 rules = [
     '(allow user-preference-read (preference-domain ".GlobalPreferences"))',
     f'(allow file-read* (literal "{pc}/App Settings/{bid}.plist"))',
     f'(allow file-read* file-write* (subpath "{pc}/Keymapping/{bid}"))',
-] + [f'(allow file-read* file-write* (literal "{chain}{suffix}"))' for suffix in ("", "-journal", "-wal", "-shm")] + [
-    '(deny process-fork)',
-] + [f'(deny file* file-read* file-read-metadata file-ioctl (literal "{p}"))'
-     for p in ("/bin/bash", "/usr/sbin/sshd", "/usr/libexec/ssh-keysign", "/bin/sh",
-               "/etc/ssh/sshd_config", "/usr/libexec/sftp-server", "/usr/bin/ssh")]
+]
+# The database and the journal files SQLite writes beside it.
+rules += [f'(allow file-read* file-write* (literal "{chain}{suffix}"))' for suffix in ("", "-journal", "-wal", "-shm")]
+rules += ['(deny process-fork)']
+rules += [f'(deny file* file-read* file-read-metadata file-ioctl (literal "{p}"))' for p in JAILBREAK_PROBES]
 with open(ents, "rb") as f:
     d = plistlib.load(f)
 d["com.apple.security.temporary-exception.sbpl"] = rules
@@ -623,7 +681,7 @@ echo "Signing (ad-hoc, $COUNT Mach-O binaries converted to Mac Catalyst) ..."
 # (measured 2026-09-06: SIGKILL, CODESIGNING Invalid Page).
 while IFS= read -r f; do
   codesign --force --sign - "$f" 2>"$WORK/codesign.err" \
-    || die "codesign failed on ${f#"$APP"/}: $(tr '\n' ' ' < "$WORK/codesign.err")"
+    || die "codesign failed on ${f#"$APP"/}: $(oneline "$WORK/codesign.err")"
 done < "$MACHOS"
 # Then each nested bundle, inside-out, so their seals match the new binaries.
 # A macOS-style bundle (AKInterface) keeps its Info.plist under Contents/.
@@ -633,18 +691,18 @@ find "$APP" -depth -mindepth 1 -type d \( -name '*.framework' -o -name '*.appex'
       codesign --force --sign - "$b" 2>/dev/null || true
     done
 codesign --force --sign - --entitlements "$ENTS" "$APP" 2>"$WORK/codesign.err" \
-  || die "codesign failed: $(tr '\n' ' ' < "$WORK/codesign.err")"
+  || die "codesign failed: $(oneline "$WORK/codesign.err")"
 # Verify every Mach-O the way dyld will, not just the bundle seal.
-BAD=""
+UNVERIFIED=""
 while IFS= read -r f; do
-  codesign --verify --strict "$f" 2>/dev/null || BAD="$BAD  ${f#"$APP"/}"$'\n'
+  codesign --verify --strict "$f" 2>/dev/null || UNVERIFIED="$UNVERIFIED  ${f#"$APP"/}"$'\n'
 done < "$MACHOS"
 if [ "$PLAYTOOLS" -eq 1 ]; then
-  codesign --verify --strict "$AKI" 2>/dev/null || BAD="$BAD  PlugIns/AKInterface.bundle"$'\n'
+  codesign --verify --strict "$AK_BUNDLE" 2>/dev/null || UNVERIFIED="$UNVERIFIED  PlugIns/AKInterface.bundle"$'\n'
 fi
-[ -z "$BAD" ] || die "these binaries would be killed at load (signature does not verify):"$'\n'"$BAD"
+[ -z "$UNVERIFIED" ] || die "these binaries would be killed at load (signature does not verify):"$'\n'"$UNVERIFIED"
 codesign --verify --strict "$APP" 2>"$WORK/verify.err" \
-  || die "bundle signature does not verify: $(tr '\n' ' ' < "$WORK/verify.err")"
+  || die "bundle signature does not verify: $(oneline "$WORK/verify.err")"
 xattr -rd com.apple.quarantine "$APP" 2>/dev/null || true
 
 # PlayTools' settings and keymap, written BEFORE the previous copy is moved
@@ -663,8 +721,10 @@ mkdir -p "$DEST" 2>/dev/null || die "cannot create $DEST"
 [ -w "$DEST" ] || die "$DEST is not writable"
 TARGET="$DEST/$NAME.app"
 if [ -e "$TARGET" ]; then
+  # Either shape: what this tool installs keeps the iOS layout, but the target
+  # may be an ordinary Mac app someone else put there.
   OLD_BID=$(plutil -extract CFBundleIdentifier raw -o - "$TARGET/Info.plist" 2>/dev/null \
-         || plutil -extract CFBundleIdentifier raw -o - "$TARGET/Contents/Info.plist" 2>/dev/null || true)
+         || plist_get "$TARGET/Contents/Info.plist" CFBundleIdentifier)
   if [ "$OLD_BID" != "$BID" ] && [ "$FORCE" -ne 1 ]; then
     die "$TARGET exists with bundle id ${OLD_BID:-unknown} (not $BID); pass --force to replace it or --dest DIR"
   fi
@@ -676,21 +736,19 @@ if [ -e "$TARGET" ]; then
     rm -rf "$TARGET" || die "cannot replace $TARGET"
   fi
 fi
-# --reset: the container root is containermanagerd's and cannot be moved or
-# removed from a shell without Full Disk Access, but its contents can. Flush
-# cfprefsd's cached copy of the container-scoped defaults first, or the plist
-# comes back from memory on the next launch. (Already refused above, right
-# after NAME was known and before the previous copy went to Trash, if the
-# app was still running.)
+# --reset: the container's contents, not the container. Its root belongs to
+# containermanagerd and cannot be moved or removed from a shell without Full
+# Disk Access. (A running app was already refused, back where NAME became
+# known and before the previous copy went to the Trash.)
 if [ "$RESET" -eq 1 ]; then
-  CONT="$HOME/Library/Containers/$BID/Data"
-  if [ -d "$CONT" ]; then
+  CONTAINER="$HOME/Library/Containers/$BID/Data"
+  if [ -d "$CONTAINER" ]; then
     # Through cfprefsd, so its cached copy of the container-scoped domain goes
-    # too (deleting only the plist brought the old values back on relaunch).
-    defaults delete "$CONT/Library/Preferences/$BID" >/dev/null 2>&1 || true
+    # too: deleting only the plist brought the old values back on relaunch.
+    defaults delete "$CONTAINER/Library/Preferences/$BID" >/dev/null 2>&1 || true
     # find -exec, not a glob: an unmatched glob is fatal under zsh's nomatch
     # and shellcheck's SC2115 objects to `rm -rf "$var"/*`.
-    find "$CONT" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+    find "$CONTAINER" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
     echo "  reset: container state under ~/Library/Containers/$BID/Data cleared"
   fi
   # PlayChain's store lives beside PlayTools' settings, not in the container.
@@ -735,9 +793,11 @@ fi
 if [ "$OPEN" -eq 1 ]; then
   echo "Launching ..."
   open "$TARGET" || die "open failed"
+  # Launching is not enough: a signature or platform mistake shows up as a
+  # process that dies at dyld, so wait for it to be there and stay there.
   i=0
   while [ $i -lt 30 ]; do
-    if ps -axo comm= | grep -Fx "$TARGET/$EXE" >/dev/null; then
+    if running_exe "$TARGET/$EXE"; then
       echo "  running: $EXE"
       exit 0
     fi
