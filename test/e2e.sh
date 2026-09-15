@@ -57,7 +57,17 @@ launch() {
   MARK="--- e2e $(date +%s).$RANDOM"
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
   echo "$MARK" >> "$LOG" || { echo "cannot write the probe's log ($LOG)"; exit 2; }
-  open "$APP"
+  # LaunchServices can refuse an open moments after quit_probe killed the
+  # previous instance ("_LSOpenURLsWithCompletionHandler() failed with error
+  # -600", on 6 of 9 runs of the unchanged suite, 2026-09-16), so a refused
+  # open is retried rather than counted as a launch that did not happen.
+  local tries=0
+  until open "$APP" 2>"$W/open.err"; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 10 ] || { cat "$W/open.err"; return 1; }
+    [ "$tries" -gt 1 ] || echo "  note: LaunchServices refused the open ($(tr -d '\n' < "$W/open.err")); retrying"
+    sleep 0.5
+  done
   for _ in $(seq 1 40); do logged ' launch ' && return 0; sleep 0.25; done
   return 1
 }
@@ -109,14 +119,22 @@ if launch; then
   check "device model spoofed" logged 'hw.machine=iPad13,8'
   check "keychain item stored (PlayChain)" logged 'keychain miss=.* add=0 '
   pid=$(pgrep -f "$APP/Probe" | head -1)
-  if osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $pid) to true" >/dev/null 2>&1; then
+  frontmost=0
+  for _ in 1 2 3; do
+    osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $pid) to true" >/dev/null 2>&1 \
+      && { frontmost=1; break; }
+    sleep 0.5
+  done
+  if [ "$frontmost" -eq 1 ]; then
     sleep 1
-    # Twice: the first press after the window activates reaches the probe as
-    # "touch ended" only (its began is lost; measured in the first spike too),
-    # every press after that as began + ended.
-    for _ in 1 2; do
+    # The first press after the window activates reaches the probe as "touch
+    # ended" only (its began is lost; measured in the first spike too), and
+    # how long activation takes varies (two fixed presses missed on 3 of 9
+    # runs, 2026-09-16): press until the touch is logged, at most five times.
+    for _ in 1 2 3 4 5; do
       osascript -e 'tell application "System Events" to key code 40' >/dev/null 2>&1   # K
       sleep 1
+      logged 'touch began .* nx=0\.250 ny=0\.750' && break
     done
     check "K becomes a touch at 0.25,0.75" logged 'touch began .* nx=0\.250 ny=0\.750'
   else
