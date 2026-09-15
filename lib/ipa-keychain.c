@@ -33,6 +33,9 @@
 //     kSecMatchLimit are honoured; kSecReturnRef returns the attributes
 //     dictionary (no real SecKeychainItemRef exists for these items)
 //   - kSecValuePersistentRef in a query finds the item it was returned for
+//   - accessibility and sync are stored and returned (never matched on), and
+//     an item that never set them answers the keychain's defaults, as a real
+//     keychain does; see stored_key() for the crash that taught this
 //   - every item carries kSecAttrAccessGroup, the caller's if it gave one, else
 //     a synthetic "<seed>.<bundle id>" whose 10-character seed is stable per
 //     bundle id and shaped like a team identifier. Google's SSO layer opens
@@ -106,6 +109,23 @@ static void cfstr(CFDictionaryRef d, CFStringRef key, char *out, size_t n) {
     if (v && CFGetTypeID(v) == CFStringGetTypeID()) CFStringGetCString(v, out, (CFIndex)n, kCFStringEncodingUTF8);
     else if (v) strlcpy(out, "<non-string>", n);
 }
+// The query's key NAMES (never values), for the trace: which attributes a
+// caller asked for is what explains a crash on a returned dictionary.
+static void keys_of(CFDictionaryRef d, char *out, size_t n) {
+    out[0] = 0;
+    if (!d) return;
+    CFIndex c = CFDictionaryGetCount(d);
+    const void **keys = malloc(sizeof(void *) * (size_t)(c ? c : 1));
+    CFDictionaryGetKeysAndValues(d, keys, NULL);
+    for (CFIndex i = 0; i < c; i++) {
+        char k[64] = "?";
+        if (CFGetTypeID(keys[i]) == CFStringGetTypeID()) CFStringGetCString(keys[i], k, sizeof k, kCFStringEncodingUTF8);
+        if (out[0]) strlcat(out, ",", n);
+        strlcat(out, k, n);
+    }
+    free(keys);
+}
+
 static const char *cls_of(CFDictionaryRef d) {
     CFTypeRef c = d ? CFDictionaryGetValue(d, kSecClass) : NULL;
     if (!c) return "genp?";
@@ -229,6 +249,35 @@ static bool ignored_key(CFTypeRef key) {
     return false;
 }
 
+// Keys an item KEEPS: everything that describes it, the secret, and the two
+// attributes a real keychain stores on every item and always returns --
+// accessibility (pdmn) and sync -- even though matching ignores both. Google's
+// SSO layer reads an item back with kSecReturnAttributes and CFEquals its
+// accessibility against the class it wants; with none stored that is
+// CFEqual(NULL, ...) and the app traps on its second launch (measured
+// 2026-09-16, Google Photos 7.92: signed in fine, then EXC_BREAKPOINT on
+// com.google.ssoauth.KeychainOperationQueue at every relaunch).
+static bool stored_key(CFTypeRef key, CFTypeRef value) {
+    if (CFEqual(key, kSecValueData)) return true;
+    if (CFEqual(key, kSecAttrAccessible)) return CFGetTypeID(value) == CFStringGetTypeID();
+    if (CFEqual(key, kSecAttrSynchronizable))
+        return CFGetTypeID(value) == CFBooleanGetTypeID() || CFGetTypeID(value) == CFNumberGetTypeID();
+    return !ignored_key(key);
+}
+
+// What a real keychain answers for an item that never set them: the default
+// accessibility, kSecAttrAccessibleWhenUnlocked, and not synchronizable.
+static void add_defaults(CFMutableDictionaryRef out) {
+    if (!CFDictionaryContainsKey(out, kSecAttrAccessible))
+        CFDictionarySetValue(out, kSecAttrAccessible, kSecAttrAccessibleWhenUnlocked);
+    if (!CFDictionaryContainsKey(out, kSecAttrSynchronizable)) {
+        int zero = 0;
+        CFNumberRef z = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &zero);
+        CFDictionarySetValue(out, kSecAttrSynchronizable, z);
+        CFRelease(z);
+    }
+}
+
 struct match_ctx { CFDictionaryRef item; bool ok; };
 static void match_key(const void *key, const void *value, void *ctx) {
     struct match_ctx *m = ctx;
@@ -301,6 +350,7 @@ static CFTypeRef format_item(CFDictionaryRef item, CFDictionaryRef q) {
     CFMutableDictionaryRef out = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, item);
     CFDictionaryRemoveValue(out, kIdKey);
     if (!CFDictionaryContainsKey(out, kSecAttrAccessGroup)) CFDictionarySetValue(out, kSecAttrAccessGroup, access_group());
+    add_defaults(out);
     if (!wantData) CFDictionaryRemoveValue(out, kSecValueData);
     if (wantPRef) { CFDataRef p = persistent_ref(item); if (p) { CFDictionarySetValue(out, kSecValuePersistentRef, p); CFRelease(p); } }
     return out;
@@ -333,7 +383,8 @@ static OSStatus ipa_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result
     load_items();
     CFMutableArrayRef hits = find_matches(query);
     { char a[256], sv[256]; cfstr(query, kSecAttrAccount, a, sizeof a); cfstr(query, kSecAttrService, sv, sizeof sv);
-      klog("copy  %s acct=%s svce=%s -> %ld match(es)", cls_of(query), a, sv, (long)CFArrayGetCount(hits)); }
+      char ks[512]; keys_of(query, ks, sizeof ks);
+      klog("copy  %s acct=%s svce=%s keys=%s -> %ld match(es)", cls_of(query), a, sv, ks, (long)CFArrayGetCount(hits)); }
     OSStatus rc = errSecItemNotFound;
     if (CFArrayGetCount(hits) > 0) {
         rc = errSecSuccess;
@@ -367,7 +418,7 @@ static OSStatus ipa_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     const void **keys = malloc(sizeof(void *) * (size_t)n), **vals = malloc(sizeof(void *) * (size_t)n);
     CFDictionaryGetKeysAndValues(attributes, keys, vals);
     for (CFIndex i = 0; i < n; i++) {
-        if (CFEqual(keys[i], kSecValueData) || CFEqual(keys[i], kSecClass) || !ignored_key(keys[i]))
+        if (CFEqual(keys[i], kSecClass) || stored_key(keys[i], vals[i]))
             CFDictionarySetValue(item, keys[i], vals[i]);
     }
     free(keys); free(vals);
@@ -401,7 +452,7 @@ static OSStatus ipa_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
 }
 
 static void apply_update(const void *key, const void *value, void *ctx) {
-    if (CFEqual(key, kSecValueData) || !ignored_key(key)) CFDictionarySetValue((CFMutableDictionaryRef)ctx, key, value);
+    if (stored_key(key, value)) CFDictionarySetValue((CFMutableDictionaryRef)ctx, key, value);
 }
 
 static OSStatus ipa_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef update) {
