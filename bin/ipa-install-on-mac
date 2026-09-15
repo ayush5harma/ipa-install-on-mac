@@ -1,59 +1,32 @@
 #!/usr/bin/env bash
-# Install a decrypted iOS .ipa as a Mac app that renders at the Mac's own
-# resolution and keeps its logins: re-signed, placed in /Applications, no
-# PlayCover.
+# Install a decrypted iOS .ipa as a Mac app: converted to Mac Catalyst,
+# re-signed ad-hoc, sandboxed, moved into /Applications. No PlayCover.
 #
-# See README.md for why PlayCover was rejected and the full mechanism (the
-# six steps PlayCover's own installer takes, each with an Xcode CLI
-# equivalent: lipo, vtool, install_name_tool, codesign), the measured traps,
-# and the security trade-off of the keychain shim. This script does those six
-# steps plus the two PlayTools features an APP (not a game) needs:
+# The sections below are the install, in order, and each says why it is there.
+# README.md has the whole picture; what a reader needs here is the shape:
 #
-#   RENDERING -- the app keeps the idiom it shipped with, as PlayCover does:
-#   an iPad app runs in the iPad layout, scaled to 77% on the Mac. --mac-idiom
-#   appends 6 (Mac) to UIDeviceFamily instead, so UIKit runs the process in
-#   UIUserInterfaceIdiom.mac, 1:1 with Mac points (measured 2026-09-06: idiom
-#   1 -> 5 from that one plist edit) -- right for an app that tolerates it
-#   (YouTube did), wrong for one that does not: in the Mac idiom UIKit draws
-#   its controls as native Mac controls and apps skip every .pad code path,
-#   which on Google Photos 7.92 (2026-09-16) collapsed Collections into rows
-#   of tiny push buttons and crashed every share sheet (a popover presented
-#   with no source view). The Mac idiom was the default until then.
+#   1. unpack the ipa and read its Info.plist
+#   2. neutralise a bundled keychain-fix tweak, which would steal the calls
+#      the keychain shim exists for
+#   3. refuse FairPlay-encrypted binaries, before anything has changed
+#   4. convert every Mach-O: arm64, Mac Catalyst, the system Swift overlay
+#   5. rendering: the shipped idiom, or the Mac idiom on request
+#   6. link in what the app needs -- PlayTools (--playtools), the keychain
+#      shim, the OpenGL ES redirect, --dylib libraries
+#   7. sign every Mach-O, then every nested bundle, then the app itself
+#   8. write PlayTools' settings, then move the bundle into place
 #
-#   KEYCHAIN -- an ad-hoc signature has no application-identifier, so
-#   SecItemAdd answers -34018 (errSecMissingEntitlement) and no login
-#   survives a relaunch; AMFI also refuses to spawn an ad-hoc binary that
-#   claims keychain-access-groups. The fix is PlayChain's: lib/ipa-keychain.c,
-#   built here into Frameworks/libipakeychain.dylib and linked into the main
-#   executable (lib/ipa-inject-dylib.py), interposing the four SecItem calls
-#   into a 0600 plist inside the app's sandbox container. --no-keychain
-#   leaves the app as shipped.
+# --configure does none of that: it rewrites PlayTools' settings and keymap
+# for an app that is already installed, and stops.
 #
-# --playtools (2026-09-16) adds the rest of PlayCover for GAMES, all from the
-# command line: PlayTools itself, built from upstream source at a pinned
-# commit (lib/playtools-build.sh) and embedded in the app, which gives
-# keyboard and mouse to touch mapping (--map, --drag, --joystick,
-# --mouse-look, --keymap; Cmd+K opens PlayTools' own editor in the running
-# app), resolution and aspect control (--resolution, --aspect), device model
-# spoofing and PlayChain, PlayTools' emulated keychain, which replaces the
-# shim above because PlayTools interposes the same four SecItem calls. Its
-# settings and keymaps live where PlayTools reads them,
-# ~/Library/Containers/io.playcover.PlayCover/{App Settings,Keymapping}
-# (lib/playtools-config.py writes them); --configure changes them for an
-# installed app without reinstalling. PlayCover.app is neither used nor
-# needed. README.md, "PlayTools", has the mechanism and the measurements.
+# What it needs: a DECRYPTED ipa (an App Store copy is FairPlay-encrypted and
+# refused at step 3; decrypting needs a jailbroken device or an
+# already-decrypted source, and nothing here does it), and Xcode's command
+# line tools -- lipo, otool, vtool, install_name_tool, file, and clang with
+# the macOS SDK for the libraries this builds. --playtools additionally needs
+# full Xcode with the iOS SDK and git, for its one-time build from source.
 #
-# WHAT IT NEEDS
-#   - A DECRYPTED ipa. App Store downloads are FairPlay-encrypted (cryptid 1
-#     in LC_ENCRYPTION_INFO); the script refuses them before touching
-#     anything. Decrypting needs a jailbroken device or an already-decrypted
-#     source; nothing here does it.
-#   - Xcode: lipo, otool, vtool, install_name_tool, file, and clang with the
-#     macOS SDK for the shims; codesign, plutil, xattr and python3 are macOS.
-#     --playtools needs full Xcode with the iOS SDK (xcodebuild) and git for
-#     its one-time build, which fetches from GitHub.
-#
-# The installed bundle is user-owned; remove it by dragging to Trash.
+# The installed bundle is user-owned; remove it by dragging it to the Trash.
 
 set -Eeuo pipefail
 # Under set -e a failing pipeline exits with no message; say where. -E so the
@@ -136,9 +109,10 @@ lowest_version()  { printf '%s\n' "$@" | sort -V | head -1; }
 highest_version() { printf '%s\n' "$@" | sort -V | tail -1; }
 
 IPA=""; DEST="/Applications"; OPEN=0; FORCE=0; KEEP=0; SCALED=0; KEYCHAIN=1; RESET=0
-PLAYTOOLS=0; MAC_IDIOM=0; CONFIGURE=""; INSTALL_ONLY=""
+PLAYTOOLS=0; MAC_IDIOM=0; CONFIGURE=""
+INSTALL_ONLY=""   # the last flag that only makes sense for an install, to name in the error
 PT_ARGS=()   # handed to lib/playtools-config.py as given
-EXTRA=()     # --dylib files, absolute paths
+DYLIBS=()    # --dylib files, absolute paths
 while [ $# -gt 0 ]; do
   case "$1" in
     --dest)  [ $# -ge 2 ] || usage; DEST="$2"; INSTALL_ONLY="$1"; shift 2 ;;
@@ -155,7 +129,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || usage
       [ -f "$2" ] || die "--dylib: no such file: $2"
       case "$2" in *.c|*.m|*.dylib) ;; *) die "--dylib takes a .c, .m or .dylib file: $2" ;; esac
-      EXTRA+=("$(abs_path "$2")"); INSTALL_ONLY="$1"; shift 2 ;;
+      DYLIBS+=("$(abs_path "$2")"); INSTALL_ONLY="$1"; shift 2 ;;
     --resolution|--aspect|--map|--drag|--joystick|--mouse-look|--set)
       [ $# -ge 2 ] || usage; PT_ARGS+=("$1" "$2"); PLAYTOOLS=1; shift 2 ;;
     --keymap)
@@ -167,6 +141,7 @@ while [ $# -gt 0 ]; do
     *) [ -z "$IPA" ] || usage; IPA="$1"; shift ;;
   esac
 done
+# --configure and an install are two different commands sharing one parser.
 if [ -n "$CONFIGURE" ]; then
   [ -z "$IPA" ] || die "--configure changes an installed app; it takes no ipa"
   [ -z "$INSTALL_ONLY" ] || die "$INSTALL_ONLY applies to an install, not to --configure"
@@ -178,14 +153,14 @@ fi
 # The shim and PlayTools both interpose SecItemAdd/CopyMatching/Update/Delete,
 # and PlayTools does so unconditionally (it forwards to the real keychain when
 # its PlayChain is off), so exactly one of them is the keychain.
-SHIM=0; CHAIN=0
+USE_SHIM=0; USE_PLAYCHAIN=0
 if [ "$KEYCHAIN" -eq 1 ]; then
-  if [ "$PLAYTOOLS" -eq 1 ]; then CHAIN=1; else SHIM=1; fi
+  if [ "$PLAYTOOLS" -eq 1 ]; then USE_PLAYCHAIN=1; else USE_SHIM=1; fi
 fi
 # Where PlayTools reads its settings, keymaps and PlayChain: it builds the
 # path from /Users/<login> itself (upstream reverted a portable lookup on
 # 2026-09-12), so this does too.
-PC_DIR="/Users/$(id -un)/Library/Containers/io.playcover.PlayCover"
+PLAYCOVER_DIR="/Users/$(id -un)/Library/Containers/io.playcover.PlayCover"
 
 # ── Tools ───────────────────────────────────────────────────────────────────
 # The shim's source, the load-command editor and the PlayTools helpers live in
@@ -286,11 +261,11 @@ done
 LIPO=$(xcrun -f lipo); OTOOL=$(xcrun -f otool); VTOOL=$(xcrun -f vtool)
 INSTALL_NAME_TOOL=$(xcrun -f install_name_tool)
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-if [ "$SHIM" -eq 1 ] || [ "$CHAIN" -eq 1 ] || [ "$PLAYTOOLS" -eq 1 ]; then
+if [ "$USE_SHIM" -eq 1 ] || [ "$USE_PLAYCHAIN" -eq 1 ] || [ "$PLAYTOOLS" -eq 1 ]; then
   SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode or pass --no-keychain"
 fi
-[ "$SHIM" -eq 0 ] || need_lib ipa-keychain.c ipa-inject-dylib.py
-[ ${#EXTRA[@]} -eq 0 ] || need_lib ipa-inject-dylib.py
+[ "$USE_SHIM" -eq 0 ] || need_lib ipa-keychain.c ipa-inject-dylib.py
+[ ${#DYLIBS[@]} -eq 0 ] || need_lib ipa-inject-dylib.py
 [ "$PLAYTOOLS" -eq 0 ] || need_lib ipa-inject-dylib.py playtools-build.sh playtools/Package.resolved
 
 # ── Unpack ──────────────────────────────────────────────────────────────────
@@ -375,7 +350,7 @@ link_into_app() {
 # ordinal of every later dylib -- so the FILE is replaced by an empty dylib
 # of the same install name: dyld still finds it, nothing runs.
 NEUTRALISED=""
-if [ "$SHIM" -eq 1 ] || [ "$CHAIN" -eq 1 ]; then
+if [ "$USE_SHIM" -eq 1 ] || [ "$USE_PLAYCHAIN" -eq 1 ]; then
   printf 'void ipa_neutralised(void) {}\n' > "$WORK/noop.c"
   while IFS= read -r f; do
     [ -f "$f" ] || continue
@@ -499,9 +474,20 @@ fi
 
 # ── Rendering: the shipped idiom, or the Mac idiom on request ───────────────
 # UIKit decides the idiom from UIDeviceFamily at launch; 6 = Mac. Appended,
-# never replaced, so an iPhone-only app keeps its 1. PlayTools works in
-# either (measured with the probe: its forced resolution and the keymap both
-# still apply in the Mac idiom).
+# never replaced, so an iPhone-only app keeps its 1, and it only takes effect
+# at the next cold launch. PlayTools works in either (measured with the probe:
+# its forced resolution and the keymap both still apply in the Mac idiom).
+#
+# The default is the idiom the app shipped with, as PlayCover does: an iPad
+# app runs in the iPad layout, which Catalyst scales to 77% on a Mac.
+# --mac-idiom instead runs the process in UIUserInterfaceIdiom.mac, 1:1 with
+# the Mac's points (measured 2026-09-06: the reported idiom changes 1 -> 5
+# from this one plist edit). That is right for an app that tolerates it
+# (YouTube did) and wrong for one that does not: in the Mac idiom UIKit draws
+# its controls as native Mac controls and apps skip every code path gated on
+# .pad, which on Google Photos 7.92 (2026-09-16) collapsed Collections into
+# rows of tiny push buttons and crashed every share sheet (a popover
+# presented with no source view). The Mac idiom was the default until then.
 if [ "$MAC_IDIOM" -eq 1 ]; then
   fams=$(plutil -extract UIDeviceFamily json -o - "$PLIST" 2>/dev/null || true)
   case "$fams" in
@@ -516,6 +502,13 @@ else
 fi
 
 # ── PlayTools: embedded in the app, linked into the main executable ─────────
+# PlayTools is the layer PlayCover injects into a game: keyboard and mouse to
+# touch mapping with an in-app editor (Cmd+K), resolution and aspect control,
+# device model spoofing, and PlayChain. It is built from upstream source at a
+# pinned commit (lib/playtools-build.sh) and its settings and keymaps are
+# written where it reads them (lib/playtools-config.py); PlayCover.app is
+# neither used nor needed.
+#
 # PlayCover installs one shared copy in ~/Library/Frameworks and links every
 # game to that absolute path; embedding instead pins each app to the build it
 # was installed with and never touches the copy a PlayCover.app on the same
@@ -549,7 +542,16 @@ elif [ -d "$APP/Frameworks/UnityFramework.framework" ]; then
 fi
 
 # ── Keychain: the file-backed shim, linked into the main executable ─────────
-if [ "$SHIM" -eq 1 ]; then
+# An ad-hoc signature has no application-identifier, so every SecItemAdd in a
+# Catalyst app answers -34018 (errSecMissingEntitlement) and no login survives
+# a relaunch; claiming keychain-access-groups instead makes AMFI refuse to
+# spawn the process at all. So the keychain is replaced rather than fixed:
+# lib/ipa-keychain.c (which carries the measurements and the security
+# trade-off) interposes the four SecItem calls into a 0600 plist inside the
+# app's own sandbox container. Under --playtools this is PlayChain's job
+# instead -- PlayTools interposes the same four calls, and two interposers
+# cannot share a process.
+if [ "$USE_SHIM" -eq 1 ]; then
   SHIM_LIB="$APP/Frameworks/libipakeychain.dylib"
   mkdir -p "$APP/Frameworks"
   catalyst_dylib "$SHIM_LIB" @executable_path/Frameworks/libipakeychain.dylib \
@@ -557,8 +559,8 @@ if [ "$SHIM" -eq 1 ]; then
     -O2 -framework CoreFoundation -framework Security
   link_into_app "$SHIM_LIB" @executable_path/Frameworks/libipakeychain.dylib "the keychain shim"
   KEYCHAIN_NOTE="file-backed shim; items in the container under Library/Application Support/ipa-keychain"
-elif [ "$CHAIN" -eq 1 ]; then
-  KEYCHAIN_NOTE="PlayChain, PlayTools' emulated keychain (items in $(tilde "$PC_DIR")/PlayChain/$BID.db)"
+elif [ "$USE_PLAYCHAIN" -eq 1 ]; then
+  KEYCHAIN_NOTE="PlayChain, PlayTools' emulated keychain (items in $(tilde "$PLAYCOVER_DIR")/PlayChain/$BID.db)"
 else
   KEYCHAIN_NOTE="as shipped (--no-keychain): logins will not survive a relaunch"
 fi
@@ -591,7 +593,7 @@ fi
 # Foundation and the Objective-C runtime), a prebuilt dylib is converted like
 # every other Mach-O. Linked last, so it loads after the app's own libraries
 # and can find their exported symbols with dlsym.
-for src in ${EXTRA[@]+"${EXTRA[@]}"}; do
+for src in ${DYLIBS[@]+"${DYLIBS[@]}"}; do
   # The library is named after the file, so the name has to be a plain one.
   base=$(basename "$src"); base=${base%.*}
   case "$base" in *[!A-Za-z0-9._-]*) die "--dylib: use a file name of letters, digits, . _ -: $base" ;; esac
@@ -608,7 +610,7 @@ for src in ${EXTRA[@]+"${EXTRA[@]}"}; do
         -O2 -fobjc-arc -framework Foundation -framework CoreFoundation ;;
   esac
   link_into_app "$lib" "@executable_path/Frameworks/lib$base.dylib" "lib$base.dylib"
-  EXTRA_NOTE="${EXTRA_NOTE:+$EXTRA_NOTE, }lib$base.dylib"
+  DYLIB_NOTE="${DYLIB_NOTE:+$DYLIB_NOTE, }lib$base.dylib"
 done
 
 # ── Sign ────────────────────────────────────────────────────────────────────
@@ -651,7 +653,7 @@ PLIST
 # fork() is looking for a jailbreak).
 if [ "$PLAYTOOLS" -eq 1 ]; then
   # plistlib, not `plutil -insert`: plutil reads the dots in the key as a key path.
-  python3 - "$ENTS" "$PC_DIR" "$BID" <<'PY' || die "could not add PlayTools' sandbox rules to the entitlements"
+  python3 - "$ENTS" "$PLAYCOVER_DIR" "$BID" <<'PY' || die "could not add PlayTools' sandbox rules to the entitlements"
 import plistlib, sys
 ents, pc, bid = sys.argv[1], sys.argv[2], sys.argv[3]
 chain = f"{pc}/PlayChain/{bid}.db"
@@ -712,7 +714,7 @@ xattr -rd com.apple.quarantine "$APP" 2>/dev/null || true
 PT_SUMMARY=""
 if [ "$PLAYTOOLS" -eq 1 ]; then
   PT_SUMMARY=$(python3 "$LIB_DIR/playtools-config.py" --bundle-id "$BID" \
-    --keychain "$([ "$CHAIN" -eq 1 ] && echo playchain || echo off)" ${PT_ARGS[@]+"${PT_ARGS[@]}"}) \
+    --keychain "$([ "$USE_PLAYCHAIN" -eq 1 ] && echo playchain || echo off)" ${PT_ARGS[@]+"${PT_ARGS[@]}"}) \
     || die "could not write PlayTools' settings; nothing was installed"
 fi
 
@@ -753,8 +755,8 @@ if [ "$RESET" -eq 1 ]; then
   fi
   # PlayChain's store lives beside PlayTools' settings, not in the container.
   # Settings and keymaps are configuration, not state: they stay.
-  if [ -e "$PC_DIR/PlayChain/$BID.db" ]; then
-    rm -f "$PC_DIR/PlayChain/$BID.db" "$PC_DIR/PlayChain/$BID.db-wal" "$PC_DIR/PlayChain/$BID.db-shm"
+  if [ -e "$PLAYCOVER_DIR/PlayChain/$BID.db" ]; then
+    rm -f "$PLAYCOVER_DIR/PlayChain/$BID.db" "$PLAYCOVER_DIR/PlayChain/$BID.db-wal" "$PLAYCOVER_DIR/PlayChain/$BID.db-shm"
     echo "  reset: PlayChain keychain for $BID cleared"
   fi
 fi
@@ -768,10 +770,10 @@ mv "$APP" "$TARGET" || die "could not move the bundle into $DEST"
 # ||`), so an app's first keychain write would fail with errSecIO; an empty
 # file already there is simply given its tables (CREATE TABLE IF NOT EXISTS).
 if [ "$PLAYTOOLS" -eq 1 ]; then
-  mkdir -p "$PC_DIR/Keymapping/$BID"
-  if [ "$CHAIN" -eq 1 ]; then
-    mkdir -p "$PC_DIR/PlayChain"
-    [ -e "$PC_DIR/PlayChain/$BID.db" ] || : > "$PC_DIR/PlayChain/$BID.db"
+  mkdir -p "$PLAYCOVER_DIR/Keymapping/$BID"
+  if [ "$USE_PLAYCHAIN" -eq 1 ]; then
+    mkdir -p "$PLAYCOVER_DIR/PlayChain"
+    [ -e "$PLAYCOVER_DIR/PlayChain/$BID.db" ] || : > "$PLAYCOVER_DIR/PlayChain/$BID.db"
   fi
 fi
 
@@ -783,10 +785,10 @@ fi
 echo "  rendering: $RENDER"
 echo "  keychain:  $KEYCHAIN_NOTE"
 [ -z "$GLES_NOTE" ] || echo "  opengl es: $GLES_NOTE"
-[ -z "${EXTRA_NOTE:-}" ] || echo "  linked:    $EXTRA_NOTE (--dylib)"
+[ -z "${DYLIB_NOTE:-}" ] || echo "  linked:    $DYLIB_NOTE (--dylib)"
 [ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
 if [ "$PLAYTOOLS" -eq 1 ]; then
-  echo "  playtools: ${PT_REV:0:7}, embedded; settings in $(tilde "$PC_DIR")"
+  echo "  playtools: ${PT_REV:0:7}, embedded; settings in $(tilde "$PLAYCOVER_DIR")"
   printf '%s\n' "$PT_SUMMARY" | sed 's/^/    /'
 fi
 
