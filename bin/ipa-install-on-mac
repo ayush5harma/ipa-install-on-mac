@@ -99,6 +99,8 @@ PlayTools options (install, or --configure an installed app):
 usage() { echo "$USAGE_TEXT" >&2; exit 1; }
 help()  { echo "$USAGE_TEXT"; exit 0; }
 die()  { echo "ipa-install-on-mac: $*" >&2; exit 2; }
+# ~ for $HOME in messages; ${var/#$HOME/\~} prints a literal \~ on bash 3.2.
+tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
 warn() { echo "ipa-install-on-mac: warning: $*" >&2; }
 
 IPA=""; DEST="/Applications"; OPEN=0; FORCE=0; KEEP=0; SCALED=0; KEYCHAIN=1; RESET=0
@@ -206,6 +208,7 @@ if [ -n "$CONFIGURE" ]; then
   case "$BID" in
     ""|*/*|*..*|*[!A-Za-z0-9._-]*) die "implausible bundle id: $BID" ;;
   esac
+  [ -n "$APPPATH" ] || warn "no installed app with bundle id $BID in /Applications or ~/Applications; writing its settings anyway -- check the id"
   RUNNING=0
   if [ -n "$APPPATH" ]; then
     EXE=$(plutil -extract CFBundleExecutable raw -o - "$APPPATH/Info.plist" 2>/dev/null || true)
@@ -236,12 +239,7 @@ if [ "$SHIM" -eq 1 ] || [ "$CHAIN" -eq 1 ] || [ "$PLAYTOOLS" -eq 1 ]; then
   SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode or pass --no-keychain"
 fi
 [ "$SHIM" -eq 0 ] || need_lib ipa-keychain.c ipa-inject-dylib.py
-if [ "$PLAYTOOLS" -eq 1 ]; then
-  need_lib ipa-inject-dylib.py playtools-build.sh playtools/Package.resolved
-  # Built once per pinned commit and cached; the first time is about a minute.
-  PT_SRC=$("$LIB_DIR/playtools-build.sh") || die "could not build PlayTools (see above)"
-  PT_REV=$("$LIB_DIR/playtools-build.sh" --rev)
-fi
+[ "$PLAYTOOLS" -eq 0 ] || need_lib ipa-inject-dylib.py playtools-build.sh playtools/Package.resolved
 
 # ── Unpack ──────────────────────────────────────────────────────────────────
 # The work dir is under TMPDIR, the same APFS volume as /Applications, so the
@@ -276,6 +274,11 @@ BID=$(pl CFBundleIdentifier);   [ -n "$BID" ] || die "Info.plist has no CFBundle
 # Real bundle ids are reverse-DNS: letters, digits, dots and hyphens only.
 case "$BID" in
   ""|*/*|*..*|*[!A-Za-z0-9._-]*) die "implausible bundle id: $BID" ;;
+esac
+# Same for the executable's name: it is chmod'ed and has load commands
+# injected, so "../../.ssh/id_ed25519" must never be a path this reaches.
+case "$EXE" in
+  */*|.|..) die "implausible executable name: $EXE" ;;
 esac
 NAME=$(pl CFBundleDisplayName); [ -n "$NAME" ] || NAME=$(pl CFBundleName); [ -n "$NAME" ] || NAME="$EXE"
 NAME=$(printf '%s' "$NAME" | tr '/:' '__')
@@ -347,6 +350,14 @@ done < "$MACHOS"
 if [ -n "$ENCRYPTED" ]; then
   printf 'ipa-install-on-mac: %s is FairPlay-encrypted (cryptid 1), still an App Store copy:\n%s' "$NAME" "$ENCRYPTED" >&2
   die "decrypt it first; this tool does not (and cannot) remove FairPlay"
+fi
+
+# PlayTools is built once per pinned commit and cached (the first time is
+# about a minute and needs the network) -- only now, so an ipa refused above
+# never costs a build.
+if [ "$PLAYTOOLS" -eq 1 ]; then
+  PT_SRC=$("$LIB_DIR/playtools-build.sh") || die "could not build PlayTools (see above)"
+  PT_REV=$("$LIB_DIR/playtools-build.sh" --rev)
 fi
 
 # ── Convert: arm64 only, Mac Catalyst platform, system Swift UIKit overlay ──
@@ -475,7 +486,7 @@ if [ "$SHIM" -eq 1 ]; then
   printf '%s\n' "$SHIMLIB" >> "$MACHOS"
   KEYCHAIN_NOTE="file-backed shim; items in the container under Library/Application Support/ipa-keychain"
 elif [ "$CHAIN" -eq 1 ]; then
-  KEYCHAIN_NOTE="PlayChain, PlayTools' emulated keychain (items in ${PC_DIR/#$HOME/\~}/PlayChain/$BID.db)"
+  KEYCHAIN_NOTE="PlayChain, PlayTools' emulated keychain (items in $(tilde "$PC_DIR")/PlayChain/$BID.db)"
 else
   KEYCHAIN_NOTE="as shipped (--no-keychain): logins will not survive a relaunch"
 fi
@@ -487,7 +498,11 @@ fi
 # measurements: Google Photos' editor, EXC_BAD_ACCESS in libGL's
 # glCreateShader). Only apps that link OpenGL ES get it.
 GLES_NOTE=""
-if xargs "$OTOOL" -L < "$MACHOS" 2>/dev/null | grep -F '/OpenGLES.framework/' >/dev/null; then
+# NUL-separated and captured first: a Mach-O path with a space ("Share
+# Extension.appex") or a quote split or stopped a plain xargs, and one failing
+# otool then made the whole pipeline false under pipefail.
+{ tr '\n' '\0' < "$MACHOS" | xargs -0 "$OTOOL" -L; } > "$WORK/linked" 2>/dev/null || true
+if grep -F '/OpenGLES.framework/' "$WORK/linked" >/dev/null; then
   need_lib ipa-gles.c ipa-inject-dylib.py
   [ -n "${SDK:-}" ] || SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode"
   GLESLIB="$APP/Frameworks/libipagles.dylib"
@@ -529,23 +544,28 @@ cat > "$ENTS" <<'PLIST'
   <key>com.apple.security.print</key><true/>
 </dict></plist>
 PLIST
-# PlayTools reads and writes its settings, keymaps and PlayChain under
-# PlayCover's directory, outside the app's own container; PlayCover grants
-# that with one sandbox-profile exception and adds the same always-on rules
-# (Rules/default.yaml "allow", then no fork and no shells: an app probing for
-# /bin/bash or a working fork() is looking for a jailbreak). The same set
-# here, minus PlayCover's read rule for ~/Library/Frameworks/PlayTools.framework,
-# which an embedded copy does not need.
+# PlayTools reads its settings, keymaps and PlayChain under PlayCover's
+# directory, outside the app's own container, so the app needs a sandbox
+# exception for them. PlayCover grants read-write on the WHOLE directory
+# (and read on every Group Container, write on .GlobalPreferences); here the
+# rules name this app's own files only, because that directory also holds
+# every other PlayTools app's plaintext PlayChain, and an ipa is untrusted
+# input: settings read-only (only this tool writes them), its keymap
+# directory read-write (the in-app editor saves there), its PlayChain
+# database and SQLite's journal files beside it. PlayCover's always-on
+# denies stay (no fork, no shells: an app probing for /bin/bash or a working
+# fork() is looking for a jailbreak).
 if [ "$PLAYTOOLS" -eq 1 ]; then
   # plistlib, not `plutil -insert`: plutil reads the dots in the key as a key path.
-  python3 - "$ENTS" "$PC_DIR" "/Users/$(id -un)" <<'PY' || die "could not add PlayTools' sandbox rules to the entitlements"
+  python3 - "$ENTS" "$PC_DIR" "$BID" <<'PY' || die "could not add PlayTools' sandbox rules to the entitlements"
 import plistlib, sys
-ents, pc, home = sys.argv[1], sys.argv[2], sys.argv[3]
+ents, pc, bid = sys.argv[1], sys.argv[2], sys.argv[3]
+chain = f"{pc}/PlayChain/{bid}.db"
 rules = [
-    '(allow user-preference-write (preference-domain ".GlobalPreferences"))',
     '(allow user-preference-read (preference-domain ".GlobalPreferences"))',
-    f'(allow file* file-read* file-write* file-write-data file-read-metadata file-ioctl (subpath "{pc}"))',
-    f'(allow file* file-read* (subpath "{home}/Library/Group Containers/"))',
+    f'(allow file-read* (literal "{pc}/App Settings/{bid}.plist"))',
+    f'(allow file-read* file-write* (subpath "{pc}/Keymapping/{bid}"))',
+] + [f'(allow file-read* file-write* (literal "{chain}{suffix}"))' for suffix in ("", "-journal", "-wal", "-shm")] + [
     '(deny process-fork)',
 ] + [f'(deny file* file-read* file-read-metadata file-ioctl (literal "{p}"))'
      for p in ("/bin/bash", "/usr/sbin/sshd", "/usr/libexec/ssh-keysign", "/bin/sh",
@@ -588,6 +608,17 @@ fi
 codesign --verify --strict "$APP" 2>"$WORK/verify.err" \
   || die "bundle signature does not verify: $(tr '\n' ' ' < "$WORK/verify.err")"
 xattr -rd com.apple.quarantine "$APP" 2>/dev/null || true
+
+# PlayTools' settings and keymap, written BEFORE the previous copy is moved
+# aside: an option the writer refuses (an --aspect the resolution does not
+# take) must stop the run while the old install is still in place. Nothing
+# here needs the bundle, only its id.
+PT_SUMMARY=""
+if [ "$PLAYTOOLS" -eq 1 ]; then
+  PT_SUMMARY=$(python3 "$LIB_DIR/playtools-config.py" --bundle-id "$BID" \
+    --keychain "$([ "$CHAIN" -eq 1 ] && echo playchain || echo off)" ${PT_ARGS[@]+"${PT_ARGS[@]}"}) \
+    || die "could not write PlayTools' settings; nothing was installed"
+fi
 
 # ── Install ─────────────────────────────────────────────────────────────────
 mkdir -p "$DEST" 2>/dev/null || die "cannot create $DEST"
@@ -634,11 +665,18 @@ fi
 mv "$APP" "$TARGET" || die "could not move the bundle into $DEST"
 [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$TARGET" >/dev/null 2>&1 || true
 
-PT_SUMMARY=""
+# What the scoped sandbox rules cannot create from inside the app: its keymap
+# directory (the editor saves there; the rules cover it, not its parent) and
+# its PlayChain database. PlayTools' own first connection creates an empty
+# database and then returns nil (PlayedAppleDB.connectToDB: `!alreadyCreated
+# ||`), so an app's first keychain write would fail with errSecIO; an empty
+# file already there is simply given its tables (CREATE TABLE IF NOT EXISTS).
 if [ "$PLAYTOOLS" -eq 1 ]; then
-  PT_SUMMARY=$(python3 "$LIB_DIR/playtools-config.py" --bundle-id "$BID" \
-    --keychain "$([ "$CHAIN" -eq 1 ] && echo playchain || echo off)" ${PT_ARGS[@]+"${PT_ARGS[@]}"}) \
-    || die "installed $TARGET, but could not write PlayTools' settings; fix the error above and run: ipa-install-on-mac --configure $BID ..."
+  mkdir -p "$PC_DIR/Keymapping/$BID"
+  if [ "$CHAIN" -eq 1 ]; then
+    mkdir -p "$PC_DIR/PlayChain"
+    [ -e "$PC_DIR/PlayChain/$BID.db" ] || : > "$PC_DIR/PlayChain/$BID.db"
+  fi
 fi
 
 echo "Installed $TARGET"
@@ -651,7 +689,7 @@ echo "  keychain:  $KEYCHAIN_NOTE"
 [ -z "$GLES_NOTE" ] || echo "  opengl es: $GLES_NOTE"
 [ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
 if [ "$PLAYTOOLS" -eq 1 ]; then
-  echo "  playtools: ${PT_REV:0:7}, embedded; settings in ${PC_DIR/#$HOME/\~}"
+  echo "  playtools: ${PT_REV:0:7}, embedded; settings in $(tilde "$PC_DIR")"
   printf '%s\n' "$PT_SUMMARY" | sed 's/^/    /'
 fi
 

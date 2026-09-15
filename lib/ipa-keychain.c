@@ -35,7 +35,9 @@
 //   - kSecValuePersistentRef in a query finds the item it was returned for
 //   - accessibility and sync are stored and returned (never matched on), and
 //     an item that never set them answers the keychain's defaults, as a real
-//     keychain does; see stored_key() for the crash that taught this
+//     keychain does; see stored_key() for the crash that taught this. An
+//     item added with kSecAttrAccessControl (not a plist value, so not
+//     stored) reads back as the default class, not the one it implied
 //   - every item carries kSecAttrAccessGroup, the caller's if it gave one, else
 //     a synthetic "<seed>.<bundle id>" whose 10-character seed is stable per
 //     bundle id and shaped like a team identifier. Google's SSO layer opens

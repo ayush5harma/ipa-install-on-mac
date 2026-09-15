@@ -44,10 +44,13 @@ static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
 static void open_libraries(void) {
     // The iOS path; dyld maps it to the iOSSupport copy in a Catalyst process.
-    g_gles = dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY | RTLD_GLOBAL);
+    // RTLD_FIRST: a lookup through these handles searches that image only,
+    // not its dependencies -- without it "glob" resolved through OpenGLES's
+    // libSystem dependency instead of reaching the real dlsym.
+    g_gles = dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY | RTLD_GLOBAL | RTLD_FIRST);
     // Already loaded in every Catalyst process; NOLOAD so this never loads it.
     g_desktop = dlopen("/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib",
-                       RTLD_LAZY | RTLD_NOLOAD);
+                       RTLD_LAZY | RTLD_NOLOAD | RTLD_FIRST);
 }
 
 // The real dlsym: calls from this image are not interposed by its own tuple.

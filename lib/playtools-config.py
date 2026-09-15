@@ -27,6 +27,7 @@ Usage: playtools-config.py --bundle-id BID [options]    write, then summarise
 Run with --help for the options.
 """
 import argparse
+import math
 import os
 import plistlib
 import pwd
@@ -197,9 +198,16 @@ def coerce(key, raw):
             return False
         raise UsageError(f"--set {key}: expected true or false, got {raw!r}")
     try:
-        return want(raw)
+        value = want(raw)
     except ValueError:
         raise UsageError(f"--set {key}: expected {want.__name__}, got {raw!r}") from None
+    # A plist integer is 64-bit and Swift decodes these as Int/Double: an
+    # out-of-range or non-finite value would make PlayTools drop the file.
+    if want is float and not math.isfinite(value):
+        raise UsageError(f"--set {key}: expected a finite number, got {raw!r}")
+    if want is int and not -2**63 <= value < 2**63:
+        raise UsageError(f"--set {key}: out of range, got {raw!r}")
+    return value
 
 
 def parse_set(spec):
@@ -332,6 +340,8 @@ def keymap_from_file(path, bid):
             e.update(keyName=j.get("keyName") or "Keyboard", transform=transform_of(j))
             if "mode" in j:
                 e["mode"] = int(j["mode"])
+                if e["mode"] not in (0, 1):   # JoystickMode: FIXED, FLOATING
+                    raise ValueError(f"joystick mode {e['mode']}")
             out["joystickModel"].append(e)
         for m in km.get("mouseAreaModel", []):
             out["mouseAreaModel"].append({"keyName": m.get("keyName") or "Mouse", "transform": transform_of(m)})
@@ -432,6 +442,13 @@ def main(argv):
         if a.check:
             if a.keymap:
                 keymap_from_file(a.keymap, "check")
+            if a.aspect is not None:
+                if res is not None:
+                    # the combination is decidable here; without --resolution it
+                    # depends on the app's saved settings, checked at write time
+                    apply_resolution(dict(DEFAULTS), res, a.aspect, lambda: (1920, 1080))
+                elif a.aspect.strip().lower() not in set(ASPECTS) | set(RESIZABLE_ASPECT):
+                    raise UsageError(f"--aspect: expected 4:3, 16:9, 16:10 or free; got {a.aspect!r}")
             return 0
         if not a.bundle_id:
             raise UsageError("--bundle-id is required")
