@@ -201,11 +201,15 @@ fi
 # `file` exits non-zero on an odd file and xargs then returns 123, which under
 # pipefail aborted the script with no message on a real app (a ~4000-file
 # tweaked app). Capture first, tolerate the status, filter second.
+# The C locale throughout: `file` describes data files from their bytes, and
+# macOS awk in a UTF-8 locale aborts on the first invalid sequence ("towc:
+# multibyte conversion failure", measured 2026-09-16 on Google Photos 7.92,
+# a resource `file` took for a matrix with a garbage byte in its header).
 MACHOS="$WORK/machos"
-{ find "$APP" -type f -print0 | xargs -0 file --no-dereference -F "$(printf '\t')"; } > "$WORK/file.out" 2>/dev/null || true
+{ find "$APP" -type f -print0 | LC_ALL=C xargs -0 file --no-dereference -F "$(printf '\t')"; } > "$WORK/file.out" 2>/dev/null || true
 # A fat binary gets extra lines "path (for architecture X):" after its own;
 # drop those or lipo is handed a name that does not exist.
-awk -F '\t' '$2 ~ /Mach-O/ && $1 !~ / \(for architecture [^)]*\):?$/ { print $1 }' "$WORK/file.out" | sort -u > "$MACHOS"
+LC_ALL=C awk -F '\t' '$2 ~ /Mach-O/ && $1 !~ / \(for architecture [^)]*\):?$/ { print $1 }' "$WORK/file.out" | LC_ALL=C sort -u > "$MACHOS"
 [ -s "$MACHOS" ] || die "no Mach-O binaries found in the bundle"
 
 # ── Refuse FairPlay-encrypted binaries before changing anything ─────────────
