@@ -9,11 +9,16 @@
 # and the security trade-off of the keychain shim. This script does those six
 # steps plus the two PlayTools features an APP (not a game) needs:
 #
-#   RESOLUTION -- UIKit reads UIDeviceFamily from the bundle at launch, and
-#   with 6 (Mac) present the process runs in UIUserInterfaceIdiom.mac: 1:1
-#   with Mac points instead of the iPad layout scaled to 77% (measured
-#   2026-09-06: idiom 1 -> 5 from that one plist edit). --scaled keeps the
-#   shipped families instead.
+#   RENDERING -- the app keeps the idiom it shipped with, as PlayCover does:
+#   an iPad app runs in the iPad layout, scaled to 77% on the Mac. --mac-idiom
+#   appends 6 (Mac) to UIDeviceFamily instead, so UIKit runs the process in
+#   UIUserInterfaceIdiom.mac, 1:1 with Mac points (measured 2026-09-06: idiom
+#   1 -> 5 from that one plist edit) -- right for an app that tolerates it
+#   (YouTube did), wrong for one that does not: in the Mac idiom UIKit draws
+#   its controls as native Mac controls and apps skip every .pad code path,
+#   which on Google Photos 7.92 (2026-09-16) collapsed Collections into rows
+#   of tiny push buttons and crashed every share sheet (a popover presented
+#   with no source view). The Mac idiom was the default until then.
 #
 #   KEYCHAIN -- an ad-hoc signature has no application-identifier, so
 #   SecItemAdd answers -34018 (errSecMissingEntitlement) and no login
@@ -24,30 +29,31 @@
 #   into a 0600 plist inside the app's sandbox container. --no-keychain
 #   leaves the app as shipped.
 #
+# --playtools (2026-09-16) adds the rest of PlayCover for GAMES, all from the
+# command line: PlayTools itself, built from upstream source at a pinned
+# commit (lib/playtools-build.sh) and embedded in the app, which gives
+# keyboard and mouse to touch mapping (--map, --drag, --joystick,
+# --mouse-look, --keymap; Cmd+K opens PlayTools' own editor in the running
+# app), resolution and aspect control (--resolution, --aspect), device model
+# spoofing and PlayChain, PlayTools' emulated keychain, which replaces the
+# shim above because PlayTools interposes the same four SecItem calls. Its
+# settings and keymaps live where PlayTools reads them,
+# ~/Library/Containers/io.playcover.PlayCover/{App Settings,Keymapping}
+# (lib/playtools-config.py writes them); --configure changes them for an
+# installed app without reinstalling. PlayCover.app is neither used nor
+# needed. README.md, "PlayTools", has the mechanism and the measurements.
+#
 # WHAT IT NEEDS
 #   - A DECRYPTED ipa. App Store downloads are FairPlay-encrypted (cryptid 1
 #     in LC_ENCRYPTION_INFO); the script refuses them before touching
 #     anything. Decrypting needs a jailbroken device or an already-decrypted
 #     source; nothing here does it.
 #   - Xcode: lipo, otool, vtool, install_name_tool, file, and clang with the
-#     macOS SDK for the shim; codesign, plutil, xattr and python3 are macOS.
+#     macOS SDK for the shims; codesign, plutil, xattr and python3 are macOS.
+#     --playtools needs full Xcode with the iOS SDK (xcodebuild) and git for
+#     its one-time build, which fetches from GitHub.
 #
 # The installed bundle is user-owned; remove it by dragging to Trash.
-#
-# Usage:
-#   ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain] [--reset]
-#     --dest DIR     install into DIR instead of /Applications
-#     --open         launch it afterwards and confirm the process appeared
-#     --force        replace a bundle of the same name even if its bundle id
-#                    differs (a Mac app that happens to share the name)
-#     --keep         keep the work directory for inspection
-#     --scaled       keep the iPad idiom (the 77% scaled rendering)
-#     --no-keychain  do not link the keychain shim (logins will not persist)
-#     --reset        wipe the app's sandbox container (Data/) before installing:
-#                    preferences, caches, the shim's keychain store (2026-09-06:
-#                    an earlier, differently-signed install of the same app
-#                    left an account in preferences with no matching keychain
-#                    entry)
 
 set -Eeuo pipefail
 # Under set -e a failing pipeline exits with no message; say where. -E so the
@@ -56,7 +62,35 @@ set -Eeuo pipefail
 # inherit ERR into functions at all.
 trap 'echo "ipa-install-on-mac: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
-USAGE_TEXT="Usage: ipa-install-on-mac <file.ipa> [--dest DIR] [--open] [--force] [--keep] [--scaled] [--no-keychain] [--reset]"
+USAGE_TEXT='Usage: ipa-install-on-mac <file.ipa> [options]
+       ipa-install-on-mac --configure <App.app | bundle id> [PlayTools options] [--open]
+
+Install options:
+  --dest DIR        install into DIR instead of /Applications
+  --open            launch it afterwards and confirm the process appeared
+  --force           replace a same-named bundle even if its bundle id differs
+  --keep            keep the work directory for inspection
+  --mac-idiom       render in the Mac idiom (1:1 with the display) instead of
+                    the shipped iPad/iPhone layout; see README before using it
+  --scaled          the shipped idiom (the default; kept for old invocations)
+  --no-keychain     no emulated keychain: logins will not survive a relaunch
+  --reset           clear the app'"'"'s sandbox container and emulated keychain first
+  --playtools       embed PlayTools (keyboard/mouse mapping, resolution control);
+                    implied by every option below
+
+PlayTools options (install, or --configure an installed app):
+  --resolution R    auto | 1080p | 1440p | 4k | WIDTHxHEIGHT | resizable | app-default
+  --aspect A        4:3 | 16:9 | 16:10 (1080p/1440p/4k), or free (resizable)
+  --map KEY=X,Y[,S]       KEY taps the screen at X,Y (fractions of the window,
+                          0,0 top left); S = size, % of the longer side
+  --drag KEY=X,Y[,S]      KEY holds a touch at X,Y and the mouse drags it
+  --joystick KEYS=X,Y[,S] wasd | arrows | UP/LEFT/DOWN/RIGHT drive a stick at X,Y
+  --mouse-look X,Y[,S]    the mouse moves a touch in this area (camera)
+  --keymap FILE     start the keymap from a PlayCover keymap (.playmap / .plist)
+  --set KEY=VALUE   any other PlayTools setting, e.g. iosDeviceModel=iPad13,8,
+                    hideTitleBar=true, customScaler=1.5, sensitivity=70
+  Any --map/--drag/--joystick/--mouse-look/--keymap replaces the default keymap;
+  without them the existing one (e.g. made with Cmd+K in the app) is kept.'
 # Two exits for the same text: a bad invocation (missing/unknown argument, no
 # ipa given) is a usage ERROR -- stderr, exit 1, the shell convention -- while
 # an explicit -h/--help asked for exactly this text and gets it on stdout with
@@ -68,24 +102,128 @@ die()  { echo "ipa-install-on-mac: $*" >&2; exit 2; }
 warn() { echo "ipa-install-on-mac: warning: $*" >&2; }
 
 IPA=""; DEST="/Applications"; OPEN=0; FORCE=0; KEEP=0; SCALED=0; KEYCHAIN=1; RESET=0
+PLAYTOOLS=0; MAC_IDIOM=0; CONFIGURE=""; INSTALL_ONLY=""
+PT_ARGS=()   # handed to lib/playtools-config.py as given
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dest)  [ $# -ge 2 ] || usage; DEST="$2"; shift 2 ;;
+    --dest)  [ $# -ge 2 ] || usage; DEST="$2"; INSTALL_ONLY="$1"; shift 2 ;;
     --open)  OPEN=1; shift ;;
-    --force) FORCE=1; shift ;;
-    --keep)  KEEP=1; shift ;;
-    --scaled)      SCALED=1; shift ;;
-    --no-keychain) KEYCHAIN=0; shift ;;
-    --reset)       RESET=1; shift ;;
+    --force) FORCE=1; INSTALL_ONLY="$1"; shift ;;
+    --keep)  KEEP=1; INSTALL_ONLY="$1"; shift ;;
+    --scaled)      SCALED=1; INSTALL_ONLY="$1"; shift ;;
+    --no-keychain) KEYCHAIN=0; INSTALL_ONLY="$1"; shift ;;
+    --reset)       RESET=1; INSTALL_ONLY="$1"; shift ;;
+    --playtools)   PLAYTOOLS=1; INSTALL_ONLY="$1"; shift ;;
+    --mac-idiom)   MAC_IDIOM=1; INSTALL_ONLY="$1"; shift ;;
+    --configure)   [ $# -ge 2 ] || usage; CONFIGURE="$2"; shift 2 ;;
+    --resolution|--aspect|--map|--drag|--joystick|--mouse-look|--set)
+      [ $# -ge 2 ] || usage; PT_ARGS+=("$1" "$2"); PLAYTOOLS=1; shift 2 ;;
+    --keymap)
+      [ $# -ge 2 ] || usage
+      [ -f "$2" ] || die "--keymap: no such file: $2"
+      PT_ARGS+=("$1" "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"); PLAYTOOLS=1; shift 2 ;;
     -h|--help) help ;;
     -*) usage ;;
     *) [ -z "$IPA" ] || usage; IPA="$1"; shift ;;
   esac
 done
-[ -n "$IPA" ] || usage
-[ -f "$IPA" ] || die "no such file: $IPA"
+if [ -n "$CONFIGURE" ]; then
+  [ -z "$IPA" ] || die "--configure changes an installed app; it takes no ipa"
+  [ -z "$INSTALL_ONLY" ] || die "$INSTALL_ONLY applies to an install, not to --configure"
+else
+  [ -n "$IPA" ] || usage
+  [ -f "$IPA" ] || die "no such file: $IPA"
+fi
+[ "$MAC_IDIOM" -eq 0 ] || [ "$SCALED" -eq 0 ] || die "--mac-idiom and --scaled contradict each other"
+# The shim and PlayTools both interpose SecItemAdd/CopyMatching/Update/Delete,
+# and PlayTools does so unconditionally (it forwards to the real keychain when
+# its PlayChain is off), so exactly one of them is the keychain.
+SHIM=0; CHAIN=0
+if [ "$KEYCHAIN" -eq 1 ]; then
+  if [ "$PLAYTOOLS" -eq 1 ]; then CHAIN=1; else SHIM=1; fi
+fi
+# Where PlayTools reads its settings, keymaps and PlayChain: it builds the
+# path from /Users/<login> itself (upstream reverted a portable lookup on
+# 2026-09-12), so this does too.
+PC_DIR="/Users/$(id -un)/Library/Containers/io.playcover.PlayCover"
 
 # ── Tools ───────────────────────────────────────────────────────────────────
+# The shim's source, the load-command editor and the PlayTools helpers live in
+# ../lib relative to this script's REAL location (not $0 as typed), so a
+# symlink into ~/.local/bin (see install.sh) still finds them: resolve every
+# level of symlink by hand rather than relying on `readlink -f`, which is a
+# GNU extension and not the BSD readlink macOS ships.
+resolve_path() {
+  local target="$1" link dir
+  while [ -L "$target" ]; do
+    link="$(readlink "$target")"
+    case "$link" in
+      /*) target="$link" ;;
+      *)  target="$(dirname "$target")/$link" ;;
+    esac
+  done
+  dir="$(cd "$(dirname "$target")" && pwd)"
+  printf '%s/%s\n' "$dir" "$(basename "$target")"
+}
+SELF="$(resolve_path "$0")"
+# 2>/dev/null + || true: a cd failure (../lib does not exist at all) must
+# fall through to the die() below with its hint, not abort here with a raw
+# "no such file or directory".
+LIB_DIR="$(cd "$(dirname "$SELF")/../lib" 2>/dev/null && pwd || true)"
+need_lib() {
+  local f
+  for f in "$@"; do
+    [ -n "$LIB_DIR" ] && [ -f "$LIB_DIR/$f" ] || die "lib/$f not found next to $SELF"
+  done
+}
+if [ -z "$CONFIGURE" ] || [ "$PLAYTOOLS" -eq 1 ]; then
+  command -v python3 >/dev/null 2>&1 || die "missing python3 (Xcode's Command Line Tools provide it)"
+fi
+if [ "$PLAYTOOLS" -eq 1 ] || [ -n "$CONFIGURE" ]; then
+  need_lib playtools-config.py
+  # Refuse a malformed --map/--resolution/... before minutes of work, not after.
+  python3 "$LIB_DIR/playtools-config.py" --check ${PT_ARGS[@]+"${PT_ARGS[@]}"} || exit 1
+fi
+
+# ── --configure: settings and keymap only, for an app already installed ────
+if [ -n "$CONFIGURE" ]; then
+  APPPATH=""; BID=""
+  if [ -d "$CONFIGURE" ]; then
+    APPPATH="$(cd "$CONFIGURE" && pwd)"
+    BID=$(plutil -extract CFBundleIdentifier raw -o - "$APPPATH/Info.plist" 2>/dev/null || true)
+    [ -n "$BID" ] || die "$CONFIGURE has no Info.plist with a CFBundleIdentifier"
+  else
+    BID="$CONFIGURE"
+    for d in /Applications "$HOME/Applications"; do
+      for a in "$d"/*.app; do
+        [ -f "$a/Info.plist" ] || continue
+        if [ "$(plutil -extract CFBundleIdentifier raw -o - "$a/Info.plist" 2>/dev/null || true)" = "$BID" ]; then
+          APPPATH="$a"; break 2
+        fi
+      done
+    done
+  fi
+  case "$BID" in
+    ""|*/*|*..*|*[!A-Za-z0-9._-]*) die "implausible bundle id: $BID" ;;
+  esac
+  RUNNING=0
+  if [ -n "$APPPATH" ]; then
+    EXE=$(plutil -extract CFBundleExecutable raw -o - "$APPPATH/Info.plist" 2>/dev/null || true)
+    if ! otool -L "$APPPATH/$EXE" 2>/dev/null | grep -F 'PlayTools.framework/PlayTools' >/dev/null; then
+      warn "$APPPATH has no PlayTools linked (installed without --playtools?); these settings apply once it is reinstalled with --playtools"
+    fi
+    ps -axo comm= | grep -Fx "$APPPATH/$EXE" >/dev/null && RUNNING=1
+  fi
+  echo "PlayTools settings for $BID${APPPATH:+ ($APPPATH)}:"
+  python3 "$LIB_DIR/playtools-config.py" --bundle-id "$BID" ${PT_ARGS[@]+"${PT_ARGS[@]}"} | sed 's/^/  /'
+  if [ "$RUNNING" -eq 1 ]; then
+    echo "It is running: quit it (Cmd+Q) and open it again for these to apply; PlayTools reads them at launch."
+  elif [ "$OPEN" -eq 1 ] && [ -n "$APPPATH" ]; then
+    open "$APPPATH" && echo "Launched $APPPATH"
+  fi
+  exit 0
+fi
+
 for t in unzip plutil codesign xattr file; do
   command -v "$t" >/dev/null 2>&1 || die "missing $t"
 done
@@ -94,33 +232,15 @@ for t in lipo otool vtool install_name_tool; do
 done
 LIPO=$(xcrun -f lipo); OTOOL=$(xcrun -f otool); VTOOL=$(xcrun -f vtool); INT=$(xcrun -f install_name_tool)
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-if [ "$KEYCHAIN" -eq 1 ]; then
-  command -v python3 >/dev/null 2>&1 || die "missing python3 (needed to link the keychain shim; or pass --no-keychain)"
+if [ "$SHIM" -eq 1 ] || [ "$CHAIN" -eq 1 ] || [ "$PLAYTOOLS" -eq 1 ]; then
   SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode or pass --no-keychain"
-  # The shim's source and the load-command editor live in ../lib relative to
-  # this script's REAL location (not $0 as typed), so a symlink into
-  # ~/.local/bin (see install.sh) still finds them: resolve every level of
-  # symlink by hand rather than relying on `readlink -f`, which is a GNU
-  # extension and not the BSD readlink macOS ships.
-  resolve_path() {
-    local target="$1" link dir
-    while [ -L "$target" ]; do
-      link="$(readlink "$target")"
-      case "$link" in
-        /*) target="$link" ;;
-        *)  target="$(dirname "$target")/$link" ;;
-      esac
-    done
-    dir="$(cd "$(dirname "$target")" && pwd)"
-    printf '%s/%s\n' "$dir" "$(basename "$target")"
-  }
-  SELF="$(resolve_path "$0")"
-  # 2>/dev/null + || true: a cd failure (../lib does not exist at all) must
-  # fall through to the die() below with its --no-keychain suggestion, not
-  # abort here with a raw "no such file or directory" and no such hint.
-  LIB_DIR="$(cd "$(dirname "$SELF")/../lib" 2>/dev/null && pwd || true)"
-  [ -n "$LIB_DIR" ] && [ -f "$LIB_DIR/ipa-keychain.c" ] && [ -f "$LIB_DIR/ipa-inject-dylib.py" ] \
-    || die "lib/ipa-keychain.c and lib/ipa-inject-dylib.py not found next to $SELF; pass --no-keychain to skip"
+fi
+[ "$SHIM" -eq 0 ] || need_lib ipa-keychain.c ipa-inject-dylib.py
+if [ "$PLAYTOOLS" -eq 1 ]; then
+  need_lib ipa-inject-dylib.py playtools-build.sh playtools/Package.resolved
+  # Built once per pinned commit and cached; the first time is about a minute.
+  PT_SRC=$("$LIB_DIR/playtools-build.sh") || die "could not build PlayTools (see above)"
+  PT_REV=$("$LIB_DIR/playtools-build.sh" --rev)
 fi
 
 # ── Unpack ──────────────────────────────────────────────────────────────────
@@ -176,12 +296,13 @@ fi
 # ── Keychain-fix tweaks: neutralised, the shim is the keychain now ──────────
 # See README.md's "Measured traps": a sideloading tweak that hooks
 # SecItemAdd steals the calls the shim exists for (measured 2026-09-06 on a
-# tweaked app carrying a `[sideloadKeychainFix].dylib`).
+# tweaked app carrying a `[sideloadKeychainFix].dylib`). PlayChain sits in the
+# same place, so the same tweaks are emptied under --playtools.
 # Its load command is not removed -- that would shift the two-level namespace
 # ordinal of every later dylib -- so the FILE is replaced by an empty dylib
 # of the same install name: dyld still finds it, nothing runs.
 NEUTRALISED=""
-if [ "$KEYCHAIN" -eq 1 ]; then
+if [ "$SHIM" -eq 1 ] || [ "$CHAIN" -eq 1 ]; then
   printf 'void ipa_neutralised(void) {}\n' > "$WORK/noop.c"
   while IFS= read -r f; do
     [ -f "$f" ] || continue
@@ -248,9 +369,22 @@ convert_macho() {
   if [ "$(printf '%s\n' "$archs" | wc -w)" -gt 1 ]; then
     "$LIPO" -thin arm64 -output "$f.thin" "$f" && mv -f "$f.thin" "$f" || die "lipo -thin failed on ${f#"$APP"/}"
   fi
-  # PlayCover's exact target values; LaunchServices then treats the bundle as
-  # a Catalyst app, which an ad-hoc signature is allowed to launch.
-  "$VTOOL" -set-build-version maccatalyst 11.0 14.0 -replace -output "$f.vt" "$f" >/dev/null 2>"$WORK/vtool.err" \
+  # PlayCover's minimum (11.0), so LaunchServices treats the bundle as a
+  # Catalyst app, which an ad-hoc signature is allowed to launch -- but the
+  # binary's OWN SDK version, not PlayCover's 14.0. UIKit and SwiftUI switch
+  # behaviour on the SDK an app was linked against ("linked on or after"), and
+  # a Catalyst build version counts in iOS versions, so 14.0 told a 2026 app it
+  # was built for iOS 14: Google Photos 7.92 (SDK 26.4) then showed no photo
+  # grid, no Videos or Creations, and its Recently Added grid laid itself out
+  # at zero width forever, the main thread pinned in SwiftUI (measured
+  # 2026-09-16; with its own 26.4 every one of them renders).
+  local sdk
+  sdk=$("$OTOOL" -l "$f" 2>/dev/null | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS/ { c = 1 } c && $1 == "sdk" && !d { print $2; d = 1 }' || true)
+  case "$sdk" in
+    [0-9]*.[0-9]*) [ "$(printf '%s\n14.0\n' "$sdk" | sort -V | head -1)" = "14.0" ] || sdk=14.0 ;;
+    *) sdk=14.0 ;;
+  esac
+  "$VTOOL" -set-build-version maccatalyst 11.0 "$sdk" -replace -output "$f.vt" "$f" >/dev/null 2>"$WORK/vtool.err" \
     && mv -f "$f.vt" "$f" \
     || die "vtool could not rewrite the platform of ${f#"$APP"/}: $(tr '\n' ' ' < "$WORK/vtool.err")"
   # /usr/lib/swift has no UIKit overlay on macOS; Catalyst's copy lives under
@@ -274,10 +408,12 @@ if [ -n "$MINOS" ] && [ "$(printf '%s\n11.0\n' "$MINOS" | sort -V | tail -1)" !=
   plutil -replace MinimumOSVersion -string 11.0 "$PLIST" >/dev/null
 fi
 
-# ── Rendering: the Mac idiom ────────────────────────────────────────────────
+# ── Rendering: the shipped idiom, or the Mac idiom on request ───────────────
 # UIKit decides the idiom from UIDeviceFamily at launch; 6 = Mac. Appended,
-# never replaced, so an iPhone-only app keeps its 1.
-if [ "$SCALED" -eq 0 ]; then
+# never replaced, so an iPhone-only app keeps its 1. PlayTools works in
+# either (measured with the probe: its forced resolution and the keymap both
+# still apply in the Mac idiom).
+if [ "$MAC_IDIOM" -eq 1 ]; then
   fams=$(plutil -extract UIDeviceFamily json -o - "$PLIST" 2>/dev/null || true)
   case "$fams" in
     "")                          plutil -insert UIDeviceFamily -json '[1,2,6]' "$PLIST" >/dev/null ;;
@@ -286,24 +422,84 @@ if [ "$SCALED" -eq 0 ]; then
   esac
   RENDER="Mac idiom, 1:1 with the display (UIDeviceFamily $(plutil -extract UIDeviceFamily json -o - "$PLIST" 2>/dev/null))"
 else
-  RENDER="scaled iPad idiom (--scaled)"
+  RENDER="shipped idiom (UIDeviceFamily $(plutil -extract UIDeviceFamily json -o - "$PLIST" 2>/dev/null || echo '?'))"
+  if [ "$PLAYTOOLS" -eq 1 ]; then RENDER="$RENDER, screen size set by PlayTools"; else RENDER="$RENDER; --mac-idiom renders 1:1 instead"; fi
+fi
+
+# ── PlayTools: embedded in the app, linked into the main executable ─────────
+# PlayCover installs one shared copy in ~/Library/Frameworks and links every
+# game to that absolute path; embedding instead pins each app to the build it
+# was installed with and never touches the copy a PlayCover.app on the same
+# Mac keeps there. PlayTools loads its AppKit half from
+# Bundle.main.builtInPlugInsURL (AKPluginLoader.swift), i.e. the APP's
+# PlugIns/, which is where AKInterface.bundle goes. AKInterface is a native
+# macOS bundle and stays one: signed below, never converted.
+if [ "$PLAYTOOLS" -eq 1 ]; then
+  PTD="$APP/Frameworks/PlayTools.framework"
+  AKI="$APP/PlugIns/AKInterface.bundle"
+  mkdir -p "$APP/Frameworks" "$APP/PlugIns"
+  rm -rf "$PTD" "$AKI"
+  cp -R "$PT_SRC" "$PTD"
+  mv "$PTD/PlugIns/AKInterface.bundle" "$AKI"
+  rm -rf "$PTD/PlugIns" "$PTD/Headers" "$PTD/Modules"
+  # Its toasts look their strings up in Bundle.main (table "Playtools"): into
+  # the app's own lproj directories that match, en only when none do -- a new
+  # lproj directory makes the whole app claim that localization.
+  placed=0
+  for l in "$PTD"/*.lproj; do
+    [ -f "$l/Playtools.strings" ] && [ -d "$APP/${l##*/}" ] || continue
+    cp "$l/Playtools.strings" "$APP/${l##*/}/"; placed=1
+  done
+  if [ "$placed" -eq 0 ] && [ -f "$PTD/en.lproj/Playtools.strings" ]; then
+    mkdir -p "$APP/en.lproj"; cp "$PTD/en.lproj/Playtools.strings" "$APP/en.lproj/"
+  fi
+  convert_macho "$PTD/PlayTools"
+  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" @executable_path/Frameworks/PlayTools.framework/PlayTools >/dev/null 2>"$WORK/inject.err" \
+    || die "could not link PlayTools into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
+  printf '%s\n' "$PTD/PlayTools" >> "$MACHOS"
+elif [ -d "$APP/Frameworks/UnityFramework.framework" ]; then
+  echo "  hint: this looks like a game (UnityFramework); --playtools adds keyboard and mouse mapping"
 fi
 
 # ── Keychain: the file-backed shim, linked into the main executable ─────────
-if [ "$KEYCHAIN" -eq 1 ]; then
-  SHIM="$APP/Frameworks/libipakeychain.dylib"
+if [ "$SHIM" -eq 1 ]; then
+  SHIMLIB="$APP/Frameworks/libipakeychain.dylib"
   mkdir -p "$APP/Frameworks"
   xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -O2 -dynamiclib \
     -framework CoreFoundation -framework Security \
     -install_name @executable_path/Frameworks/libipakeychain.dylib \
-    -o "$SHIM" "$LIB_DIR/ipa-keychain.c" 2>"$WORK/clang.err" \
+    -o "$SHIMLIB" "$LIB_DIR/ipa-keychain.c" 2>"$WORK/clang.err" \
     || die "could not build the keychain shim: $(tr '\n' ' ' < "$WORK/clang.err")"
   python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" @executable_path/Frameworks/libipakeychain.dylib >/dev/null 2>"$WORK/inject.err" \
     || die "could not link the keychain shim into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
-  printf '%s\n' "$SHIM" >> "$MACHOS"
+  printf '%s\n' "$SHIMLIB" >> "$MACHOS"
   KEYCHAIN_NOTE="file-backed shim; items in the container under Library/Application Support/ipa-keychain"
+elif [ "$CHAIN" -eq 1 ]; then
+  KEYCHAIN_NOTE="PlayChain, PlayTools' emulated keychain (items in ${PC_DIR/#$HOME/\~}/PlayChain/$BID.db)"
 else
   KEYCHAIN_NOTE="as shipped (--no-keychain): logins will not survive a relaunch"
+fi
+
+# ── OpenGL ES: runtime GL lookups answered by OpenGL ES, as on iOS ─────────
+# Every Catalyst process also has desktop OpenGL loaded, first in the global
+# search, so dlsym(RTLD_DEFAULT, "gl...") hands an app desktop libGL, which
+# crashes at its first call without a CGL context (lib/ipa-gles.c has the
+# measurements: Google Photos' editor, EXC_BAD_ACCESS in libGL's
+# glCreateShader). Only apps that link OpenGL ES get it.
+GLES_NOTE=""
+if xargs "$OTOOL" -L < "$MACHOS" 2>/dev/null | grep -F '/OpenGLES.framework/' >/dev/null; then
+  need_lib ipa-gles.c ipa-inject-dylib.py
+  [ -n "${SDK:-}" ] || SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode"
+  GLESLIB="$APP/Frameworks/libipagles.dylib"
+  mkdir -p "$APP/Frameworks"
+  xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$SDK" -O2 -dynamiclib \
+    -install_name @executable_path/Frameworks/libipagles.dylib \
+    -o "$GLESLIB" "$LIB_DIR/ipa-gles.c" 2>"$WORK/clang.err" \
+    || die "could not build the OpenGL ES shim: $(tr '\n' ' ' < "$WORK/clang.err")"
+  python3 "$LIB_DIR/ipa-inject-dylib.py" "$APP/$EXE" @executable_path/Frameworks/libipagles.dylib >/dev/null 2>"$WORK/inject.err" \
+    || die "could not link the OpenGL ES shim into $EXE: $(tr '\n' ' ' < "$WORK/inject.err")"
+  printf '%s\n' "$GLESLIB" >> "$MACHOS"
+  GLES_NOTE="links OpenGL ES: run-time GL lookups answered by OpenGL ES, not desktop GL (libipagles)"
 fi
 
 # ── Sign ────────────────────────────────────────────────────────────────────
@@ -333,6 +529,34 @@ cat > "$ENTS" <<'PLIST'
   <key>com.apple.security.print</key><true/>
 </dict></plist>
 PLIST
+# PlayTools reads and writes its settings, keymaps and PlayChain under
+# PlayCover's directory, outside the app's own container; PlayCover grants
+# that with one sandbox-profile exception and adds the same always-on rules
+# (Rules/default.yaml "allow", then no fork and no shells: an app probing for
+# /bin/bash or a working fork() is looking for a jailbreak). The same set
+# here, minus PlayCover's read rule for ~/Library/Frameworks/PlayTools.framework,
+# which an embedded copy does not need.
+if [ "$PLAYTOOLS" -eq 1 ]; then
+  # plistlib, not `plutil -insert`: plutil reads the dots in the key as a key path.
+  python3 - "$ENTS" "$PC_DIR" "/Users/$(id -un)" <<'PY' || die "could not add PlayTools' sandbox rules to the entitlements"
+import plistlib, sys
+ents, pc, home = sys.argv[1], sys.argv[2], sys.argv[3]
+rules = [
+    '(allow user-preference-write (preference-domain ".GlobalPreferences"))',
+    '(allow user-preference-read (preference-domain ".GlobalPreferences"))',
+    f'(allow file* file-read* file-write* file-write-data file-read-metadata file-ioctl (subpath "{pc}"))',
+    f'(allow file* file-read* (subpath "{home}/Library/Group Containers/"))',
+    '(deny process-fork)',
+] + [f'(deny file* file-read* file-read-metadata file-ioctl (literal "{p}"))'
+     for p in ("/bin/bash", "/usr/sbin/sshd", "/usr/libexec/ssh-keysign", "/bin/sh",
+               "/etc/ssh/sshd_config", "/usr/libexec/sftp-server", "/usr/bin/ssh")]
+with open(ents, "rb") as f:
+    d = plistlib.load(f)
+d["com.apple.security.temporary-exception.sbpl"] = rules
+with open(ents, "wb") as f:
+    plistlib.dump(d, f)
+PY
+fi
 echo "Signing (ad-hoc, $COUNT Mach-O binaries converted to Mac Catalyst) ..."
 # Every Mach-O is signed on its own, as PlayCover does after each conversion:
 # `codesign --deep` finds NO nested code in an iOS flat bundle (no Contents/),
@@ -344,9 +568,10 @@ while IFS= read -r f; do
     || die "codesign failed on ${f#"$APP"/}: $(tr '\n' ' ' < "$WORK/codesign.err")"
 done < "$MACHOS"
 # Then each nested bundle, inside-out, so their seals match the new binaries.
+# A macOS-style bundle (AKInterface) keeps its Info.plist under Contents/.
 find "$APP" -depth -mindepth 1 -type d \( -name '*.framework' -o -name '*.appex' -o -name '*.bundle' \) -print0 \
   | while IFS= read -r -d '' b; do
-      [ -f "$b/Info.plist" ] || continue
+      [ -f "$b/Info.plist" ] || [ -f "$b/Contents/Info.plist" ] || continue
       codesign --force --sign - "$b" 2>/dev/null || true
     done
 codesign --force --sign - --entitlements "$ENTS" "$APP" 2>"$WORK/codesign.err" \
@@ -356,6 +581,9 @@ BAD=""
 while IFS= read -r f; do
   codesign --verify --strict "$f" 2>/dev/null || BAD="$BAD  ${f#"$APP"/}"$'\n'
 done < "$MACHOS"
+if [ "$PLAYTOOLS" -eq 1 ]; then
+  codesign --verify --strict "$AKI" 2>/dev/null || BAD="$BAD  PlugIns/AKInterface.bundle"$'\n'
+fi
 [ -z "$BAD" ] || die "these binaries would be killed at load (signature does not verify):"$'\n'"$BAD"
 codesign --verify --strict "$APP" 2>"$WORK/verify.err" \
   || die "bundle signature does not verify: $(tr '\n' ' ' < "$WORK/verify.err")"
@@ -396,9 +624,22 @@ if [ "$RESET" -eq 1 ]; then
     find "$CONT" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
     echo "  reset: container state under ~/Library/Containers/$BID/Data cleared"
   fi
+  # PlayChain's store lives beside PlayTools' settings, not in the container.
+  # Settings and keymaps are configuration, not state: they stay.
+  if [ -e "$PC_DIR/PlayChain/$BID.db" ]; then
+    rm -f "$PC_DIR/PlayChain/$BID.db" "$PC_DIR/PlayChain/$BID.db-wal" "$PC_DIR/PlayChain/$BID.db-shm"
+    echo "  reset: PlayChain keychain for $BID cleared"
+  fi
 fi
 mv "$APP" "$TARGET" || die "could not move the bundle into $DEST"
 [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$TARGET" >/dev/null 2>&1 || true
+
+PT_SUMMARY=""
+if [ "$PLAYTOOLS" -eq 1 ]; then
+  PT_SUMMARY=$(python3 "$LIB_DIR/playtools-config.py" --bundle-id "$BID" \
+    --keychain "$([ "$CHAIN" -eq 1 ] && echo playchain || echo off)" ${PT_ARGS[@]+"${PT_ARGS[@]}"}) \
+    || die "installed $TARGET, but could not write PlayTools' settings; fix the error above and run: ipa-install-on-mac --configure $BID ..."
+fi
 
 echo "Installed $TARGET"
 echo "  bundle id $BID, signed ad-hoc, sandboxed (container: ~/Library/Containers/$BID)"
@@ -407,7 +648,12 @@ if [ "$RESET" -eq 0 ] && [ -d "$HOME/Library/Containers/$BID/Data/Library" ]; th
 fi
 echo "  rendering: $RENDER"
 echo "  keychain:  $KEYCHAIN_NOTE"
+[ -z "$GLES_NOTE" ] || echo "  opengl es: $GLES_NOTE"
 [ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
+if [ "$PLAYTOOLS" -eq 1 ]; then
+  echo "  playtools: ${PT_REV:0:7}, embedded; settings in ${PC_DIR/#$HOME/\~}"
+  printf '%s\n' "$PT_SUMMARY" | sed 's/^/    /'
+fi
 
 if [ "$OPEN" -eq 1 ]; then
   echo "Launching ..."
