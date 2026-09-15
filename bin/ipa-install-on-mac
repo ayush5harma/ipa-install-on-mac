@@ -100,8 +100,8 @@ running_exe() { ps -axo comm= | grep -Fx "$1" >/dev/null; }
 # compiled against it. $1 says what to do about it, which depends on why it
 # was needed (the keychain shim can be skipped, the OpenGL ES one cannot).
 need_sdk() {
-  [ -n "${SDK:-}" ] || SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) \
-    || die "no macOS SDK (xcrun --sdk macosx); $1"
+  [ -z "$SDK" ] || return 0
+  SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); $1"
 }
 # Version order, for the two versions that are compared here (each binary's
 # SDK, and MinimumOSVersion); sort -V, because 14.10 is above 14.9.
@@ -111,6 +111,10 @@ highest_version() { printf '%s\n' "$@" | sort -V | tail -1; }
 IPA=""; DEST="/Applications"; OPEN=0; FORCE=0; KEEP=0; SCALED=0; KEYCHAIN=1; RESET=0
 PLAYTOOLS=0; MAC_IDIOM=0; CONFIGURE=""
 INSTALL_ONLY=""   # the last flag that only makes sense for an install, to name in the error
+# Declared here because they are filled in part way through, and an exported
+# SDK or DYLIB_NOTE in the caller's environment would otherwise be picked up
+# as if this script had set it.
+SDK=""; DYLIB_NOTE=""
 PT_ARGS=()   # handed to lib/playtools-config.py as given
 DYLIBS=()    # --dylib files, absolute paths
 while [ $# -gt 0 ]; do
@@ -262,7 +266,7 @@ LIPO=$(xcrun -f lipo); OTOOL=$(xcrun -f otool); VTOOL=$(xcrun -f vtool)
 INSTALL_NAME_TOOL=$(xcrun -f install_name_tool)
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 if [ "$USE_SHIM" -eq 1 ] || [ "$USE_PLAYCHAIN" -eq 1 ] || [ "$PLAYTOOLS" -eq 1 ]; then
-  SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) || die "no macOS SDK (xcrun --sdk macosx); install Xcode or pass --no-keychain"
+  need_sdk "install Xcode or pass --no-keychain"     # before any work, not after
 fi
 [ "$USE_SHIM" -eq 0 ] || need_lib ipa-keychain.c ipa-inject-dylib.py
 [ ${#DYLIBS[@]} -eq 0 ] || need_lib ipa-inject-dylib.py
@@ -785,7 +789,7 @@ fi
 echo "  rendering: $RENDER"
 echo "  keychain:  $KEYCHAIN_NOTE"
 [ -z "$GLES_NOTE" ] || echo "  opengl es: $GLES_NOTE"
-[ -z "${DYLIB_NOTE:-}" ] || echo "  linked:    $DYLIB_NOTE (--dylib)"
+[ -z "$DYLIB_NOTE" ] || echo "  linked:    $DYLIB_NOTE (--dylib)"
 [ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
 if [ "$PLAYTOOLS" -eq 1 ]; then
   echo "  playtools: ${PT_REV:0:7}, embedded; settings in $(tilde "$PLAYCOVER_DIR")"
