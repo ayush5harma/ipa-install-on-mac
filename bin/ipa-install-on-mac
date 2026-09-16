@@ -346,10 +346,14 @@ link_into_app() {
 }
 
 # ── Keychain-fix tweaks: neutralised, the shim is the keychain now ──────────
-# See README.md's "Measured traps": a sideloading tweak that hooks
-# SecItemAdd steals the calls the shim exists for (measured 2026-09-06 on a
-# tweaked app carrying a `[sideloadKeychainFix].dylib`). PlayChain sits in the
-# same place, so the same tweaks are emptied under --playtools.
+# A sideloading tweak that hooks SecItemAdd and SecItemCopyMatching steals
+# the calls the shim exists for. Such a tweak strips the access group for a
+# different signing scheme entirely (AltStore/TrollStore-style), and under an
+# ad-hoc signature its own probe fails, so it forwards every call straight to
+# the real, missing-entitlement keychain -- silently defeating the shim if it
+# is left running (measured 2026-09-06 on a tweaked app carrying a
+# `[sideloadKeychainFix].dylib`). PlayChain sits in the same place, so the
+# same tweaks are emptied under --playtools.
 # Its load command is not removed -- that would shift the two-level namespace
 # ordinal of every later dylib -- so the FILE is replaced by an empty dylib
 # of the same install name: dyld still finds it, nothing runs.
