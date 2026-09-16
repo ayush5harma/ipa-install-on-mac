@@ -5,11 +5,12 @@
 //   A converted app's own GL calls are fine: they are bound, two-level, to
 //   /System/iOSSupport/.../OpenGLES.framework, a Metal-backed OpenGL ES
 //   ("OpenGL ES 2.0 Metal - 102") that works -- glCreateShader returns 1 with
-//   an EAGLContext current, and 0, harmlessly, with no context current. But every Catalyst
-//   process also has macOS's desktop OpenGL.framework loaded, and it comes
-//   first in the global search order, so dlsym(RTLD_DEFAULT, "glCreateShader")
-//   returns desktop libGL's glCreateShader -- whose dispatch goes through the
-//   CGL current context, which EAGL never sets (it stays NULL throughout). A
+//   an EAGLContext current, and 0, harmlessly, with no context current. But
+//   every Catalyst process also has macOS's desktop OpenGL.framework loaded,
+//   and it comes first in the global search order, so
+//   dlsym(RTLD_DEFAULT, "glCreateShader") returns desktop libGL's
+//   glCreateShader -- whose dispatch goes through the CGL current context,
+//   which EAGL never sets (it stays NULL throughout). A
 //   GL library that resolves its entry points at run time (Google's Ion,
 //   under the Ink drawing engine behind Google Photos' editor) therefore calls
 //   desktop GL and dies at the first call: EXC_BAD_ACCESS at 0x1298 inside
