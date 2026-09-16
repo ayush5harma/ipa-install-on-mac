@@ -8,7 +8,7 @@
 #   1. unpack the ipa and read its Info.plist
 #   2. neutralise a bundled keychain-fix tweak, which would steal the calls
 #      the keychain shim exists for
-#   3. refuse FairPlay-encrypted binaries, before anything has changed
+#   3. refuse FairPlay-encrypted binaries, before anything is installed
 #   4. convert every Mach-O: arm64, Mac Catalyst, the system Swift overlay
 #   5. rendering: the shipped idiom, or the Mac idiom on request
 #   6. link in what the app needs -- PlayTools (--playtools), the keychain
@@ -30,9 +30,11 @@
 
 set -Eeuo pipefail
 # Under set -e a failing pipeline exits with no message; say where. -E so the
-# trap also fires for a failure inside a function (convert_macho, cryptid_of,
-# resolve_path) rather than only at the top level -- without it bash does not
-# inherit ERR into functions at all.
+# trap also fires inside a function rather than only at the top level --
+# without it bash does not inherit ERR into functions at all. The other side
+# of that: a function's LAST command is its exit status, so a function that
+# may end on a command allowed to fail says `return 0` (see
+# configure_installed_app), which a top-level `a && b` would not have needed.
 trap 'echo "ipa-install-on-mac: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 USAGE_TEXT='Usage: ipa-install-on-mac <file.ipa> [options]
@@ -83,8 +85,10 @@ oneline() { tr '\n' ' ' < "$1"; }
 # One Info.plist value, empty when it is not there: a key this asks for is
 # usually optional, and an ipa is untrusted input.
 plist_get() { plutil -extract "$2" raw -o - "$1" 2>/dev/null || true; }
-# Absolute, without resolving symlinks: --dylib names the library it builds
-# after this file, so following a link here would rename it.
+# Absolute, without resolving symlinks: the work directory is somewhere else,
+# so a relative --dylib or --keymap has to be pinned down here, and --dylib
+# names the library it builds after this file, which following a link would
+# change.
 abs_path() { printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")"; }
 # Reverse-DNS, and nothing else: a bundle id becomes a path below (the
 # --reset container wipe, PlayTools' settings), and an ipa is untrusted
@@ -250,6 +254,10 @@ configure_installed_app() {
   elif [ "$OPEN" -eq 1 ] && [ -n "$app_path" ]; then
     open "$app_path" && echo "Launched $app_path"
   fi
+  # The settings were written, whatever `open` thought of the app: without
+  # this, a refused launch would be this function's exit status and so the
+  # script's, and set -e would report the write as a failure.
+  return 0
 }
 if [ -n "$CONFIGURE" ]; then
   configure_installed_app
@@ -732,7 +740,9 @@ mkdir -p "$DEST" 2>/dev/null || die "cannot create $DEST"
 TARGET="$DEST/$NAME.app"
 if [ -e "$TARGET" ]; then
   # Either shape: what this tool installs keeps the iOS layout, but the target
-  # may be an ordinary Mac app someone else put there.
+  # may be an ordinary Mac app someone else put there. plutil raw rather than
+  # plist_get on the first arm deliberately -- the macOS layout is consulted
+  # when the iOS one has no plist to read, not when it holds an empty id.
   OLD_BID=$(plutil -extract CFBundleIdentifier raw -o - "$TARGET/Info.plist" 2>/dev/null \
          || plist_get "$TARGET/Contents/Info.plist" CFBundleIdentifier)
   if [ "$OLD_BID" != "$BID" ] && [ "$FORCE" -ne 1 ]; then

@@ -54,7 +54,15 @@ check() { local what="$1"; shift; if "$@"; then ok "$what"; else bad "$what"; fi
 # and SIGPIPEs the producer, which pipefail then counts as a failed check.
 entitlements() { codesign -d --entitlements - "$APP" 2>/dev/null; }
 has_entitlement()  { entitlements | grep -F "$1" >/dev/null; }
-lacks_entitlement() { ! entitlements | grep -F "$1" >/dev/null; }
+# An app with no entitlements at all lacks everything, which would make a
+# negative check pass for the wrong reason: there must be some to look at.
+# Captured first rather than piped twice -- `grep -q` would exit at the first
+# line and SIGPIPE codesign, which pipefail then counts as a failed check.
+lacks_entitlement() {
+  local ents
+  ents=$(entitlements)
+  [ -n "$ents" ] && ! printf '%s\n' "$ents" | grep -F "$1" >/dev/null
+}
 links() { otool -L "$APP/Probe" 2>/dev/null | grep -F "$1" >/dev/null; }
 stamped_sdk() { otool -l "$APP/Probe" | grep -A4 LC_BUILD_VERSION | grep -F "sdk $1" >/dev/null; }
 reported() { grep -F "$1" "$W/out" >/dev/null; }   # a line of the installer's summary
