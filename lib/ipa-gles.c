@@ -4,12 +4,13 @@
 // WHY (measured 2026-09-16, macOS 27.0, Google Photos 7.92 and a probe app)
 //   A converted app's own GL calls are fine: they are bound, two-level, to
 //   /System/iOSSupport/.../OpenGLES.framework, a Metal-backed OpenGL ES
-//   ("OpenGL ES 2.0 Metal - 102") that works with EAGLContext and returns 0,
-//   harmlessly, when called with no context current. But every Catalyst
-//   process also has macOS's desktop OpenGL.framework loaded, and it comes
-//   first in the global search order, so dlsym(RTLD_DEFAULT, "glCreateShader")
-//   returns desktop libGL's glCreateShader -- whose dispatch goes through the
-//   CGL current context, which EAGL never sets (it stays NULL throughout). A
+//   ("OpenGL ES 2.0 Metal - 102") that works -- glCreateShader returns 1 with
+//   an EAGLContext current, and 0, harmlessly, with no context current. But
+//   every Catalyst process also has macOS's desktop OpenGL.framework loaded,
+//   and it comes first in the global search order, so
+//   dlsym(RTLD_DEFAULT, "glCreateShader") returns desktop libGL's
+//   glCreateShader -- whose dispatch goes through the CGL current context,
+//   which EAGL never sets (it stays NULL throughout). A
 //   GL library that resolves its entry points at run time (Google's Ion,
 //   under the Ink drawing engine behind Google Photos' editor) therefore calls
 //   desktop GL and dies at the first call: EXC_BAD_ACCESS at 0x1298 inside
@@ -32,7 +33,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
-#include <string.h>
+#include <stdbool.h>
 
 #define DYLD_INTERPOSE(_replacement, _replacee) \
     __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
@@ -58,22 +59,22 @@ static void *real_dlsym(void *handle, const char *name) {
     return dlsym(handle, name);
 }
 
-static void *gles_lookup(const char *name, int *handled) {
-    *handled = 0;
+// True when this lookup is one iOS would have answered on its own, with the
+// answer in *found: OpenGL ES's symbol, or NULL for an entry point that only
+// desktop GL has and iOS never did. False means "not ours, ask the real dlsym".
+static bool gles_answers(const char *name, void **found) {
+    *found = NULL;
     pthread_once(&g_once, open_libraries);
-    if (!g_gles) return NULL;
+    if (!g_gles) return false;
     void *p = real_dlsym(g_gles, name);
-    if (p) { *handled = 1; return p; }
-    // A desktop-only GL entry point: iOS would not have found it.
-    if (g_desktop && real_dlsym(g_desktop, name)) { *handled = 1; return NULL; }
-    return NULL;
+    if (p) { *found = p; return true; }
+    return g_desktop && real_dlsym(g_desktop, name);
 }
 
 static void *ipa_dlsym(void *handle, const char *name) {
     if (handle == RTLD_DEFAULT && name && name[0] == 'g' && name[1] == 'l') {
-        int handled;
-        void *p = gles_lookup(name, &handled);
-        if (handled) return p;
+        void *found;
+        if (gles_answers(name, &found)) return found;
     }
     __attribute__((musttail)) return dlsym(handle, name);
 }

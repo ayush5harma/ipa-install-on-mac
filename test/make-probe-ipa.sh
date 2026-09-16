@@ -20,6 +20,13 @@ trap 'rm -rf "$W"' EXIT
 APP="$W/Payload/Probe.app"
 mkdir -p "$APP/Frameworks/ProbeKit.framework"
 
+# plist_strings PLIST KEY=VALUE ...: the string-valued keys of an Info.plist.
+plist_strings() {
+  local plist="$1" kv
+  shift
+  for kv in "$@"; do plutil -insert "${kv%%=*}" -string "${kv#*=}" "$plist"; done
+}
+
 # The framework: one function the app calls at launch, so a framework the
 # installer failed to convert or sign stops the app at dyld, visibly.
 printf 'const char *probekit_hello(void) { return "probekit ok"; }\n' > "$W/probekit.c"
@@ -27,10 +34,9 @@ xcrun clang -target "$TARGET" -isysroot "$SDK" -dynamiclib \
   -install_name @rpath/ProbeKit.framework/ProbeKit \
   -o "$APP/Frameworks/ProbeKit.framework/ProbeKit" "$W/probekit.c"
 plutil -create xml1 "$APP/Frameworks/ProbeKit.framework/Info.plist"
-for kv in CFBundleIdentifier=local.ipa-install-on-mac.probekit CFBundleExecutable=ProbeKit \
-          CFBundlePackageType=FMWK CFBundleShortVersionString=1.0 CFBundleVersion=1 MinimumOSVersion=15.0; do
-  plutil -insert "${kv%%=*}" -string "${kv#*=}" "$APP/Frameworks/ProbeKit.framework/Info.plist"
-done
+plist_strings "$APP/Frameworks/ProbeKit.framework/Info.plist" \
+  CFBundleIdentifier=local.ipa-install-on-mac.probekit CFBundleExecutable=ProbeKit \
+  CFBundlePackageType=FMWK CFBundleShortVersionString=1.0 CFBundleVersion=1 MinimumOSVersion=15.0
 
 xcrun clang -target "$TARGET" -isysroot "$SDK" -fobjc-arc -fmodules \
   -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
@@ -41,12 +47,11 @@ xcrun clang -target "$TARGET" -isysroot "$SDK" -fobjc-arc -fmodules \
 
 P="$APP/Info.plist"
 plutil -create xml1 "$P"
-for kv in CFBundleIdentifier=local.ipa-install-on-mac.probe CFBundleExecutable=Probe \
-          CFBundleName=Probe "CFBundleDisplayName=IPA Probe" CFBundlePackageType=APPL \
-          CFBundleShortVersionString=1.0 CFBundleVersion=1 MinimumOSVersion=15.0 \
-          DTPlatformName=iphoneos "DTSDKName=iphoneos$SDKVER"; do
-  plutil -insert "${kv%%=*}" -string "${kv#*=}" "$P"
-done
+plist_strings "$P" \
+  CFBundleIdentifier=local.ipa-install-on-mac.probe CFBundleExecutable=Probe \
+  CFBundleName=Probe "CFBundleDisplayName=IPA Probe" CFBundlePackageType=APPL \
+  CFBundleShortVersionString=1.0 CFBundleVersion=1 MinimumOSVersion=15.0 \
+  DTPlatformName=iphoneos "DTSDKName=iphoneos$SDKVER"
 plutil -insert CFBundleSupportedPlatforms -json '["iPhoneOS"]' "$P"
 plutil -insert UIDeviceFamily -json '[1,2]' "$P"
 plutil -insert UILaunchScreen -json '{}' "$P"

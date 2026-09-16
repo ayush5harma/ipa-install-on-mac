@@ -80,11 +80,21 @@ DEFAULTS = {
 # Owned by other options, or not settings at all.
 NOT_SETTABLE = {"bundleIdentifier", "discordActivity", "version", "resolution", "aspectRatio", "playChain"}
 
-# resolution enum (PlayCover's labels) and the aspect ratios it offers
-RES_NAMES = {0: "app default", 1: "auto", 2: "1080p", 3: "1440p", 4: "4k", 5: "custom", 6: "resizable"}
-RES_HEIGHT = {2: 1080, 3: 1440, 4: 2160}
+# The resolution enum PlaySettings decodes, in PlayCover's labels. CUSTOM
+# carries its size in windowWidth/windowHeight; the fixed heights get their
+# width from the aspect ratio; RESIZABLE takes its aspect from another key.
+RES_APP_DEFAULT, RES_AUTO, RES_1080P, RES_1440P, RES_4K, RES_CUSTOM, RES_RESIZABLE = range(7)
+RES_NAMES = {RES_APP_DEFAULT: "app default", RES_AUTO: "auto", RES_1080P: "1080p",
+             RES_1440P: "1440p", RES_4K: "4k", RES_CUSTOM: "custom", RES_RESIZABLE: "resizable"}
+RES_HEIGHT = {RES_1080P: 1080, RES_1440P: 1440, RES_4K: 2160}
+RES_BY_NAME = {"app": RES_APP_DEFAULT, "app-default": RES_APP_DEFAULT, "auto": RES_AUTO,
+               "1080p": RES_1080P, "1440p": RES_1440P, "4k": RES_4K, "2160p": RES_4K,
+               "resizable": RES_RESIZABLE}
 ASPECTS = {"4:3": (0, 4, 3), "16:9": (1, 16, 9), "16:10": (2, 16, 10)}
+ASPECT_BY_CODE = {code: (name, width, height) for name, (code, width, height) in ASPECTS.items()}
+DEFAULT_ASPECT = ASPECTS["16:9"][0]           # what a file holding anything else reads as
 RESIZABLE_ASPECT = {"free": 0, "4:3": 2, "16:9": 3, "16:10": 4}
+RESIZABLE_ASPECT_BY_CODE = {code: name for name, code in RESIZABLE_ASPECT.items()}
 
 # ── Keys ────────────────────────────────────────────────────────────────────
 # USB HID usage (== GCKeyCode raw value) -> the name PlayTools dispatches on.
@@ -127,6 +137,7 @@ class UsageError(Exception):
     pass
 
 
+# ── The options, as keymap elements ─────────────────────────────────────────
 def key_code(name):
     code = LOOKUP.get(name.strip().lower())
     if code is None:
@@ -188,6 +199,17 @@ def mouse_area(spec):
     return {"keyName": "Mouse", "transform": point(spec, SIZE_MOUSE, "--mouse-look")}
 
 
+def keymap_elements(args):
+    """Every keymap option, as PlayTools' four lists of elements."""
+    return {
+        "buttonModels": [button(s, SIZE_BUTTON, "--map") for s in args.maps],
+        "draggableButtonModels": [button(s, SIZE_DRAG, "--drag") for s in args.drags],
+        "joystickModel": [joystick(s) for s in args.sticks],
+        "mouseAreaModel": [mouse_area(s) for s in args.mice],
+    }
+
+
+# ── The options, as settings ────────────────────────────────────────────────
 def coerce(key, raw):
     want = type(DEFAULTS[key])
     if want is bool:
@@ -223,13 +245,41 @@ def parse_set(spec):
 
 def parse_resolution(spec):
     s = spec.strip().lower()
-    names = {"app": 0, "app-default": 0, "auto": 1, "1080p": 2, "1440p": 3, "4k": 4, "2160p": 4, "resizable": 6}
-    if s in names:
-        return names[s], None
+    if s in RES_BY_NAME:
+        return RES_BY_NAME[s], None
     m = re.fullmatch(r"(\d{3,5})x(\d{3,5})", s)
     if m:
-        return 5, (int(m.group(1)), int(m.group(2)))
+        return RES_CUSTOM, (int(m.group(1)), int(m.group(2)))
     raise UsageError(f"--resolution: expected auto, 1080p, 1440p, 4k, WIDTHxHEIGHT, resizable or app-default; got {spec!r}")
+
+
+def apply_resolution(s, res, aspect, display):
+    if res is not None:
+        code, custom = res
+        s["resolution"] = code
+        if code == RES_CUSTOM:
+            s["windowWidth"], s["windowHeight"] = custom
+        elif code in (RES_APP_DEFAULT, RES_RESIZABLE):
+            s["windowWidth"], s["windowHeight"] = 1920, 1080
+        elif code == RES_AUTO:
+            s["windowWidth"], s["windowHeight"] = display()
+    if aspect is not None:
+        a = aspect.strip().lower()
+        if s["resolution"] == RES_RESIZABLE:
+            if a not in RESIZABLE_ASPECT:
+                raise UsageError(f"--aspect: with a resizable window, expected free, 4:3, 16:9 or 16:10; got {aspect!r}")
+            s["resizableAspectRatioType"] = RESIZABLE_ASPECT[a]
+        elif s["resolution"] in RES_HEIGHT:
+            if a not in ASPECTS:
+                raise UsageError(f"--aspect: expected 4:3, 16:9 or 16:10; got {aspect!r}")
+            s["aspectRatio"] = ASPECTS[a][0]
+        else:
+            raise UsageError(f"--aspect applies to 1080p, 1440p, 4k or resizable, not {RES_NAMES[s['resolution']]}")
+    if s["resolution"] in RES_HEIGHT:
+        # PlayCover's formula (AppSettingsView.getWidthFromAspectRatio), integer division included
+        _, wr, hr = ASPECT_BY_CODE.get(s["aspectRatio"], ASPECT_BY_CODE[DEFAULT_ASPECT])
+        h = RES_HEIGHT[s["resolution"]]
+        s["windowWidth"], s["windowHeight"] = (h // hr) * wr, h
 
 
 def main_display_points():
@@ -244,6 +294,14 @@ def main_display_points():
     except (OSError, ValueError, subprocess.SubprocessError):
         print("playtools-config: warning: could not read the display size; Auto uses 1920x1080", file=sys.stderr)
         return 1920, 1080
+
+
+def display_size(args):
+    """What --resolution auto measures: this display, or the --display given."""
+    if args.display:
+        size = tuple(int(v) for v in args.display.split("x"))
+        return lambda: size
+    return main_display_points
 
 
 # ── Files ───────────────────────────────────────────────────────────────────
@@ -291,44 +349,45 @@ def merged_settings(existing, bid):
     return out
 
 
-def apply_resolution(s, res, aspect, display):
-    if res is not None:
-        code, custom = res
-        s["resolution"] = code
-        if code == 5:
-            s["windowWidth"], s["windowHeight"] = custom
-        elif code in (0, 6):
-            s["windowWidth"], s["windowHeight"] = 1920, 1080
-        elif code == 1:
-            s["windowWidth"], s["windowHeight"] = display()
-    if aspect is not None:
-        a = aspect.strip().lower()
-        if s["resolution"] == 6:
-            if a not in RESIZABLE_ASPECT:
-                raise UsageError(f"--aspect: with a resizable window, expected free, 4:3, 16:9 or 16:10; got {aspect!r}")
-            s["resizableAspectRatioType"] = RESIZABLE_ASPECT[a]
-        elif s["resolution"] in RES_HEIGHT:
-            if a not in ASPECTS:
-                raise UsageError(f"--aspect: expected 4:3, 16:9 or 16:10; got {aspect!r}")
-            s["aspectRatio"] = ASPECTS[a][0]
-        else:
-            raise UsageError(f"--aspect applies to 1080p, 1440p, 4k or resizable, not {RES_NAMES[s['resolution']]}")
-    if s["resolution"] in RES_HEIGHT:
-        # PlayCover's formula (AppSettingsView.getWidthFromAspectRatio), integer division included
-        _, wr, hr = {v[0]: v for v in ASPECTS.values()}.get(s["aspectRatio"], ASPECTS["16:9"])
-        h = RES_HEIGHT[s["resolution"]]
-        s["windowWidth"], s["windowHeight"] = (h // hr) * wr, h
+def settings_path(root, bid):
+    return os.path.join(root, "App Settings", f"{bid}.plist")
+
+
+def write_settings(root, args, res, sets):
+    """The settings file, whole: what it held, then the defaults, then these
+    options. Written before the keymap, and before the installer moves the
+    bundle, so an option this refuses stops the run with nothing changed."""
+    path = settings_path(root, args.bundle_id)
+    s = merged_settings(load_plist(path), args.bundle_id)
+    apply_resolution(s, res, args.aspect, display_size(args))
+    for key, value in sets:
+        s[key] = value
+    if args.keychain:
+        s["playChain"] = args.keychain == "playchain"
+    write_plist(path, s)
+    return s
+
+
+# ── Keymaps ─────────────────────────────────────────────────────────────────
+def empty_keymap(bid, version="2.0.0"):
+    return {"buttonModels": [], "draggableButtonModels": [], "joystickModel": [], "mouseAreaModel": [],
+            "bundleIdentifier": bid, "version": version}
+
+
+def transform_of(e):
+    t = e["transform"]
+    return {"size": float(t["size"]), "xCoord": float(t["xCoord"]), "yCoord": float(t["yCoord"])}
 
 
 def keymap_from_file(path, bid):
+    """A PlayCover keymap, re-emitted with every field PlayTools decodes."""
     km = load_plist(path)
     if not isinstance(km, dict):
         raise UsageError(f"--keymap: {path} is not a keymap property list")
     version = str(km.get("version", "2.0.0"))
     if not version.startswith("2.0."):
         raise UsageError(f"--keymap: {path} is keymap format {version}; PlayTools reads only 2.0.x")
-    out = {"buttonModels": [], "draggableButtonModels": [], "joystickModel": [], "mouseAreaModel": [],
-           "bundleIdentifier": bid, "version": version}
+    out = empty_keymap(bid, version)
     try:
         for group in ("buttonModels", "draggableButtonModels"):
             for b in km.get(group, []):
@@ -350,13 +409,12 @@ def keymap_from_file(path, bid):
     return out
 
 
-def transform_of(e):
-    t = e["transform"]
-    return {"size": float(t["size"]), "xCoord": float(t["xCoord"]), "yCoord": float(t["yCoord"])}
-
-
 def file_url(path):
     return "file://" + urllib.parse.quote(path)
+
+
+def keymap_path(root, bid):
+    return os.path.join(root, "Keymapping", bid, "default.plist")
 
 
 def write_keymap(root, bid, km):
@@ -375,18 +433,43 @@ def write_keymap(root, bid, km):
     return default
 
 
+def write_or_read_keymap(root, args, elements):
+    """Any keymap option replaces the app's keymap; with none, the existing one
+    (the in-app editor's, say) is left alone and only read back to describe."""
+    if args.keymap or any(elements.values()):
+        km = keymap_from_file(args.keymap, args.bundle_id) if args.keymap else empty_keymap(args.bundle_id)
+        for group, items in elements.items():
+            km[group].extend(items)
+        write_keymap(root, args.bundle_id, km)
+        return km
+    path = keymap_path(root, args.bundle_id)
+    if not os.path.isfile(path):
+        return None
+    try:
+        return keymap_from_file(path, args.bundle_id)
+    except UsageError as e:
+        print(f"playtools-config: warning: the existing keymap is not readable: {e}", file=sys.stderr)
+        return None
+
+
 # ── Summary ─────────────────────────────────────────────────────────────────
+def at(element):
+    """An element's position, as the summary prints it."""
+    t = element["transform"]
+    return f"{t['xCoord']:g},{t['yCoord']:g}"
+
+
 def describe(s, km):
     res = s["resolution"]
-    if res == 6:
-        aspect = {v: k for k, v in RESIZABLE_ASPECT.items()}.get(s["resizableAspectRatioType"], "custom")
+    if res == RES_RESIZABLE:
+        aspect = RESIZABLE_ASPECT_BY_CODE.get(s["resizableAspectRatioType"], "custom")
         size = f"resizable window, aspect {aspect}"
-    elif res == 0:
+    elif res == RES_APP_DEFAULT:
         size = "app default (the app's own window)"
     else:
         label = RES_NAMES[res]
         if res in RES_HEIGHT:
-            label += " " + {v[0]: k for k, v in ASPECTS.items()}.get(s["aspectRatio"], "16:9")
+            label += " " + ASPECT_BY_CODE.get(s["aspectRatio"], ASPECT_BY_CODE[DEFAULT_ASPECT])[0]
         size = f"{label} -> {s['windowWidth']}x{s['windowHeight']}"
     lines = [f"resolution {size}, scaler {s['customScaler']:g}, device {s['iosDeviceModel']}",
              f"keyboard mapping {'on' if s['keymapping'] else 'off'} (Cmd+K edits in the app, Option toggles), "
@@ -395,18 +478,30 @@ def describe(s, km):
     if km is None:
         lines.append("keymap: none yet (PlayTools starts an empty one; Cmd+K in the app to add keys)")
     else:
-        parts = []
-        for b in km["buttonModels"]:
-            parts.append(f"{b['keyName']}@{b['transform']['xCoord']:g},{b['transform']['yCoord']:g}")
-        for b in km["draggableButtonModels"]:
-            parts.append(f"drag {b['keyName']}@{b['transform']['xCoord']:g},{b['transform']['yCoord']:g}")
+        parts = [f"{b['keyName']}@{at(b)}" for b in km["buttonModels"]]
+        parts += [f"drag {b['keyName']}@{at(b)}" for b in km["draggableButtonModels"]]
         for j in km["joystickModel"]:
             names = "/".join(KEYS.get(j[k], "?") for k in ("upKeyCode", "leftKeyCode", "downKeyCode", "rightKeyCode"))
-            parts.append(f"joystick {names}@{j['transform']['xCoord']:g},{j['transform']['yCoord']:g}")
-        for m in km["mouseAreaModel"]:
-            parts.append(f"mouse-look@{m['transform']['xCoord']:g},{m['transform']['yCoord']:g}")
+            parts.append(f"joystick {names}@{at(j)}")
+        parts += [f"mouse-look@{at(m)}" for m in km["mouseAreaModel"]]
         lines.append("keymap: " + (", ".join(parts) if parts else "empty"))
     return lines
+
+
+# ── Run ─────────────────────────────────────────────────────────────────────
+def check_options(args, res):
+    """--check: everything that can be decided without the app's own settings,
+    so ipa-install-on-mac can refuse a bad option before minutes of work."""
+    if args.keymap:
+        keymap_from_file(args.keymap, "check")
+    if args.aspect is None:
+        return
+    if res is not None:
+        # the combination is decidable here; without --resolution it
+        # depends on the app's saved settings, checked at write time
+        apply_resolution(dict(DEFAULTS), res, args.aspect, lambda: (1920, 1080))
+    elif args.aspect.strip().lower() not in set(ASPECTS) | set(RESIZABLE_ASPECT):
+        raise UsageError(f"--aspect: expected 4:3, 16:9, 16:10 or free; got {args.aspect!r}")
 
 
 def main(argv):
@@ -429,61 +524,21 @@ def main(argv):
     try:
         res = parse_resolution(a.resolution) if a.resolution else None
         sets = [parse_set(s) for s in a.sets]
-        elements = {
-            "buttonModels": [button(s, SIZE_BUTTON, "--map") for s in a.maps],
-            "draggableButtonModels": [button(s, SIZE_DRAG, "--drag") for s in a.drags],
-            "joystickModel": [joystick(s) for s in a.sticks],
-            "mouseAreaModel": [mouse_area(s) for s in a.mice],
-        }
+        elements = keymap_elements(a)
         if a.keymap and not os.path.isfile(a.keymap):
             raise UsageError(f"--keymap: no such file: {a.keymap}")
         if a.display and not re.fullmatch(r"\d+x\d+", a.display):
             raise UsageError(f"--display: expected WIDTHxHEIGHT, got {a.display!r}")
         if a.check:
-            if a.keymap:
-                keymap_from_file(a.keymap, "check")
-            if a.aspect is not None:
-                if res is not None:
-                    # the combination is decidable here; without --resolution it
-                    # depends on the app's saved settings, checked at write time
-                    apply_resolution(dict(DEFAULTS), res, a.aspect, lambda: (1920, 1080))
-                elif a.aspect.strip().lower() not in set(ASPECTS) | set(RESIZABLE_ASPECT):
-                    raise UsageError(f"--aspect: expected 4:3, 16:9, 16:10 or free; got {a.aspect!r}")
+            check_options(a, res)
             return 0
         if not a.bundle_id:
             raise UsageError("--bundle-id is required")
 
         root = a.root or default_root()
-        settings_path = os.path.join(root, "App Settings", f"{a.bundle_id}.plist")
-        s = merged_settings(load_plist(settings_path), a.bundle_id)
-        if a.display:
-            display = lambda: tuple(int(v) for v in a.display.split("x"))  # noqa: E731
-        else:
-            display = main_display_points
-        apply_resolution(s, res, a.aspect, display)
-        for key, value in sets:
-            s[key] = value
-        if a.keychain:
-            s["playChain"] = a.keychain == "playchain"
-        write_plist(settings_path, s)
-
-        km_path = os.path.join(root, "Keymapping", a.bundle_id, "default.plist")
-        if a.keymap or any(elements.values()):
-            km = keymap_from_file(a.keymap, a.bundle_id) if a.keymap else {
-                "buttonModels": [], "draggableButtonModels": [], "joystickModel": [], "mouseAreaModel": [],
-                "bundleIdentifier": a.bundle_id, "version": "2.0.0"}
-            for group, items in elements.items():
-                km[group].extend(items)
-            write_keymap(root, a.bundle_id, km)
-        else:
-            # Left as it is (it may be the in-app editor's); only described.
-            km = None
-            if os.path.isfile(km_path):
-                try:
-                    km = keymap_from_file(km_path, a.bundle_id)
-                except UsageError as e:
-                    print(f"playtools-config: warning: the existing keymap is not readable: {e}", file=sys.stderr)
-        for line in describe(s, km):
+        settings = write_settings(root, a, res, sets)
+        km = write_or_read_keymap(root, a, elements)
+        for line in describe(settings, km):
             print(line)
         return 0
     except UsageError as e:

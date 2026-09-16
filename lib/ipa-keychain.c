@@ -8,13 +8,13 @@
 // (TN3137), which needs exactly those, so every SecItemAdd answers -34018
 // errSecMissingEntitlement and a login never survives a relaunch. PlayCover's
 // PlayTools solves this with PlayChain, a replacement keychain; this is the
-// same idea in 300 lines of C with no dependencies: the four SecItem entry
-// points are interposed (dyld __interpose, honoured for a dylib linked into
-// the app, which is how ipa-install-on-mac loads it) and generic/internet
-// password items live in a binary plist inside the app's own sandbox
-// container, mode 0600. Other item classes (keys, certificates, identities)
-// pass through to the real implementation unchanged, so an app that expects a
-// SecKeyRef gets one or the real error, never a dictionary.
+// same idea in C with no dependencies: the four SecItem entry points are
+// interposed (dyld __interpose, honoured for a dylib linked into the app,
+// which is how ipa-install-on-mac loads it) and generic/internet password
+// items live in a binary plist inside the app's own sandbox container, mode
+// 0600. Other item classes (keys, certificates, identities) pass through to
+// the real implementation unchanged, so an app that expects a SecKeyRef gets
+// one or the real error, never a dictionary.
 //
 // WHAT IT IS NOT
 // Not the keychain's security: items rest on disk protected by the sandbox
@@ -40,15 +40,8 @@
 //     stored) reads back as the default class, not the one it implied
 //   - every item carries kSecAttrAccessGroup, the caller's if it gave one, else
 //     a synthetic "<seed>.<bundle id>" whose 10-character seed is stable per
-//     bundle id and shaped like a team identifier. Google's SSO layer opens
-//     with a "bundleSeedID" probe: add an item, read its attributes back, take
-//     the text before the first dot as the team seed, and build the shared
-//     account group from it. Measured 2026-09-06 on a real tweaked app: with
-//     no access group returned the seed was empty and "Sign in" showed
-//     nothing, while a keychain-fix tweak whose probe FAILED outright made the
-//     app fall back to a no-SSO path that did show the selector. A real
-//     keychain never answers that probe without a group, so neither does
-//     this one.
+//     bundle id and shaped like a team identifier; see access_group() for the
+//     sign-in that needs it
 //
 // Build (ipa-install-on-mac does this at install time):
 //   xcrun clang -target arm64-apple-ios14.0-macabi -isysroot "$(xcrun --sdk macosx --show-sdk-path)" \
@@ -73,35 +66,67 @@
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static CFMutableArrayRef g_items = NULL;   // CFMutableDictionaryRef per item
 static char g_path[PATH_MAX];
+// The id this shim gives an item, so a persistent ref can name it again. It
+// is stripped from everything handed back to the app.
 static CFStringRef kIdKey = CFSTR("_ipa_keychain_id");
+
+// ── Where it all lives ──────────────────────────────────────────────────────
+
+static void store_path(void) {
+    if (g_path[0]) return;
+    CFURLRef home = CFCopyHomeDirectoryURL();   // the sandbox container's Data dir
+    char base[PATH_MAX] = "/tmp";
+    if (home) { CFURLGetFileSystemRepresentation(home, true, (UInt8 *)base, sizeof base); CFRelease(home); }
+    snprintf(g_path, sizeof g_path, "%s/Library/Application Support/ipa-keychain/items.plist", base);
+}
+
+// The log and the DEBUG switch sit beside the store, in the same directory.
+static bool sibling_of_store(char *out, size_t n, const char *name) {
+    store_path();
+    strlcpy(out, g_path, n);
+    char *slash = strrchr(out, '/');
+    if (!slash) return false;
+    strlcpy(slash + 1, name, n - (size_t)(slash + 1 - out));
+    return true;
+}
 
 // ── Optional logging (diagnosis) ────────────────────────────────────────────
 // On when IPA_KEYCHAIN_LOG is set, or when a file named DEBUG sits beside the
 // store (touch it in the app's container to trace without relaunching a shell).
 // One line per call: op, class, account, service, whether a secret was carried,
 // how many items matched, and the return code. Never the secret bytes.
-static void store_path(void);
-static CFStringRef access_group(void);
+#define LOG_MAX_BYTES (256 * 1024)
 static char g_log[PATH_MAX];
 static int g_log_on = -1;
 
-static void klog(const char *fmt, ...) {
+static bool log_enabled(void) {
     if (g_log_on < 0) {
-        store_path();
+        char dbg[PATH_MAX];
+        struct stat st;
         g_log_on = getenv("IPA_KEYCHAIN_LOG") ? 1 : 0;
-        char dbg[PATH_MAX]; strlcpy(dbg, g_path, sizeof dbg);
-        char *slash = strrchr(dbg, '/');
-        if (slash) { strlcpy(slash + 1, "DEBUG", sizeof dbg - (size_t)(slash + 1 - dbg)); struct stat st; if (stat(dbg, &st) == 0) g_log_on = 1; }
-        strlcpy(g_log, g_path, sizeof g_log);
-        slash = strrchr(g_log, '/'); if (slash) strlcpy(slash + 1, "log.txt", sizeof g_log - (size_t)(slash + 1 - g_log));
+        if (sibling_of_store(dbg, sizeof dbg, "DEBUG") && stat(dbg, &st) == 0) g_log_on = 1;
+        sibling_of_store(g_log, sizeof g_log, "log.txt");
     }
-    if (g_log_on <= 0) return;
+    return g_log_on > 0;
+}
+
+static void klog(const char *fmt, ...) {
+    if (!log_enabled()) return;
     struct stat st;
-    if (stat(g_log, &st) == 0 && st.st_size > 256 * 1024) { char old[PATH_MAX]; snprintf(old, sizeof old, "%s.1", g_log); rename(g_log, old); }
-    FILE *f = fopen(g_log, "a"); if (!f) return;
+    if (stat(g_log, &st) == 0 && st.st_size > LOG_MAX_BYTES) {   // one generation, then overwritten
+        char old[PATH_MAX];
+        snprintf(old, sizeof old, "%s.1", g_log);
+        rename(g_log, old);
+    }
+    FILE *f = fopen(g_log, "a");
+    if (!f) return;
     fchmod(fileno(f), 0600);
-    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
-    fputc('\n', f); fclose(f);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
 }
 
 // A query attribute as a C string, for the log only (svce/acct are CFStrings).
@@ -111,6 +136,7 @@ static void cfstr(CFDictionaryRef d, CFStringRef key, char *out, size_t n) {
     if (v && CFGetTypeID(v) == CFStringGetTypeID()) CFStringGetCString(v, out, (CFIndex)n, kCFStringEncodingUTF8);
     else if (v) strlcpy(out, "<non-string>", n);
 }
+
 // The query's key NAMES (never values), for the trace: which attributes a
 // caller asked for is what explains a crash on a returned dictionary.
 static void keys_of(CFDictionaryRef d, char *out, size_t n) {
@@ -136,12 +162,26 @@ static const char *cls_of(CFDictionaryRef d) {
     return "other";
 }
 
+// What every entry point logs: the operation and the item it names. How the
+// call ended differs per operation and arrives already formatted.
+static void log_call(const char *op, CFDictionaryRef q, const char *fmt, ...) {
+    if (!log_enabled()) return;
+    char account[256], service[256], outcome[1024];
+    cfstr(q, kSecAttrAccount, account, sizeof account);
+    cfstr(q, kSecAttrService, service, sizeof service);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(outcome, sizeof outcome, fmt, ap);
+    va_end(ap);
+    klog("%s %s acct=%s svce=%s %s", op, cls_of(q), account, service, outcome);
+}
+
 // ── Storage ─────────────────────────────────────────────────────────────────
 
+// The container starts without Library/Application Support: make every level.
 static void ensure_dir(const char *file) {
     char dir[PATH_MAX]; strlcpy(dir, file, sizeof dir);
     char *slash = strrchr(dir, '/'); if (!slash) return; *slash = 0;
-    // mkdir -p for the two levels we may need (Library/Application Support)
     char *p = dir + 1;
     for (;;) {
         char *next = strchr(p, '/');
@@ -150,14 +190,6 @@ static void ensure_dir(const char *file) {
         if (!next) break;
         *next = '/'; p = next + 1;
     }
-}
-
-static void store_path(void) {
-    if (g_path[0]) return;
-    CFURLRef home = CFCopyHomeDirectoryURL();   // the sandbox container's Data dir
-    char base[PATH_MAX] = "/tmp";
-    if (home) { CFURLGetFileSystemRepresentation(home, true, (UInt8 *)base, sizeof base); CFRelease(home); }
-    snprintf(g_path, sizeof g_path, "%s/Library/Application Support/ipa-keychain/items.plist", base);
 }
 
 static bool plist_value(CFTypeRef v) {
@@ -209,6 +241,7 @@ static void save_items(void) {
     CFRelease(out);
     if (!data) return;
     ensure_dir(g_path);
+    // Written whole, then renamed: a crash mid-write cannot truncate the store.
     char tmp[PATH_MAX]; snprintf(tmp, sizeof tmp, "%s.tmp", g_path);
     FILE *f = fopen(tmp, "wb");
     if (f) {
@@ -218,6 +251,33 @@ static void save_items(void) {
         rename(tmp, g_path);
     }
     CFRelease(data);
+}
+
+// ── Access group ────────────────────────────────────────────────────────────
+// Google's SSO layer opens with a "bundleSeedID" probe: add an item, read its
+// attributes back, take the text before the first dot as the team seed, and
+// build the shared account group from it. Measured 2026-09-06 on a real
+// tweaked app: with no access group returned the seed was empty and "Sign in"
+// showed nothing, while a keychain-fix tweak whose probe FAILED outright made
+// the app fall back to a no-SSO path that did show the selector. A real
+// keychain never answers that probe without a group, so neither does this one.
+static CFStringRef g_group = NULL;
+
+static CFStringRef access_group(void) {
+    if (g_group) return g_group;
+    CFBundleRef mb = CFBundleGetMainBundle();
+    CFStringRef bid = mb ? CFBundleGetIdentifier(mb) : NULL;
+    char id[512] = "app";
+    if (bid) CFStringGetCString(bid, id, sizeof id, kCFStringEncodingUTF8);
+    unsigned long long h = 1469598103934665603ULL;            // FNV-1a over the bundle id
+    for (const char *c = id; *c; c++) { h ^= (unsigned char)*c; h *= 1099511628211ULL; }
+    static const char alpha[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    char seed[11];
+    for (int i = 0; i < 10; i++) { seed[i] = alpha[h % 32]; h /= 32; }
+    seed[10] = 0;
+    char buf[600]; snprintf(buf, sizeof buf, "%s.%s", seed, id);
+    g_group = CFStringCreateWithCString(kCFAllocatorDefault, buf, kCFStringEncodingUTF8);
+    return g_group;
 }
 
 // ── Matching ────────────────────────────────────────────────────────────────
@@ -238,6 +298,11 @@ static bool ignored_key(CFTypeRef key) {
     static CFTypeRef ignore[64]; static int n = -1;
     if (n < 0) {
         n = 0;
+        // Four of these are spelled out rather than named: Mac Catalyst has no
+        // kSecMatchDiacriticInsensitive or kSecMatchWidthInsensitive (macOS
+        // only) and deprecated kSecUseItemList and kSecUseOperationPrompt out
+        // of itself -- but an app can still pass them, so they still count as
+        // ignored. A constant the running OS lacks is NULL and is skipped.
         CFTypeRef list[] = { kSecClass, kSecReturnData, kSecReturnAttributes, kSecReturnRef, kSecReturnPersistentRef,
             kSecMatchLimit, kSecMatchCaseInsensitive, kSecMatchPolicy, kSecMatchItemList, kSecMatchSearchList,
             kSecMatchIssuers, kSecMatchEmailAddressIfPresent, kSecMatchSubjectContains, kSecMatchTrustedOnly,
@@ -265,6 +330,12 @@ static bool stored_key(CFTypeRef key, CFTypeRef value) {
     if (CFEqual(key, kSecAttrSynchronizable))
         return CFGetTypeID(value) == CFBooleanGetTypeID() || CFGetTypeID(value) == CFNumberGetTypeID();
     return !ignored_key(key);
+}
+
+// Every key worth keeping, from a caller's attributes into an item: what
+// SecItemAdd stores and what SecItemUpdate overwrites are the same set.
+static void copy_stored(const void *key, const void *value, void *ctx) {
+    if (stored_key(key, value)) CFDictionarySetValue((CFMutableDictionaryRef)ctx, key, value);
 }
 
 // What a real keychain answers for an item that never set them: the default
@@ -343,6 +414,8 @@ static CFDataRef persistent_ref(CFDictionaryRef item) {
     return CFStringCreateExternalRepresentation(kCFAllocatorDefault, id, kCFStringEncodingUTF8, 0);
 }
 
+// One item, shaped the way the query asked for it: the bare secret, a bare
+// persistent ref, or the attributes (with the secret, and the ref, if asked).
 static CFTypeRef format_item(CFDictionaryRef item, CFDictionaryRef q) {
     bool wantData = flag(q, kSecReturnData), wantAttrs = flag(q, kSecReturnAttributes);
     bool wantRef = flag(q, kSecReturnRef), wantPRef = flag(q, kSecReturnPersistentRef);
@@ -358,25 +431,6 @@ static CFTypeRef format_item(CFDictionaryRef item, CFDictionaryRef q) {
     return out;
 }
 
-// ── Access group ────────────────────────────────────────────────────────────
-static CFStringRef g_group = NULL;
-static CFStringRef access_group(void) {
-    if (g_group) return g_group;
-    CFBundleRef mb = CFBundleGetMainBundle();
-    CFStringRef bid = mb ? CFBundleGetIdentifier(mb) : NULL;
-    char id[512] = "app";
-    if (bid) CFStringGetCString(bid, id, sizeof id, kCFStringEncodingUTF8);
-    unsigned long long h = 1469598103934665603ULL;            // FNV-1a over the bundle id
-    for (const char *c = id; *c; c++) { h ^= (unsigned char)*c; h *= 1099511628211ULL; }
-    static const char alpha[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    char seed[11];
-    for (int i = 0; i < 10; i++) { seed[i] = alpha[h % 32]; h /= 32; }
-    seed[10] = 0;
-    char buf[600]; snprintf(buf, sizeof buf, "%s.%s", seed, id);
-    g_group = CFStringCreateWithCString(kCFAllocatorDefault, buf, kCFStringEncodingUTF8);
-    return g_group;
-}
-
 // ── The four entry points ───────────────────────────────────────────────────
 
 static OSStatus ipa_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
@@ -384,9 +438,11 @@ static OSStatus ipa_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result
     pthread_mutex_lock(&g_lock);
     load_items();
     CFMutableArrayRef hits = find_matches(query);
-    { char a[256], sv[256]; cfstr(query, kSecAttrAccount, a, sizeof a); cfstr(query, kSecAttrService, sv, sizeof sv);
-      char ks[512]; keys_of(query, ks, sizeof ks);
-      klog("copy  %s acct=%s svce=%s keys=%s -> %ld match(es)", cls_of(query), a, sv, ks, (long)CFArrayGetCount(hits)); }
+    if (log_enabled()) {
+        char keys[512];
+        keys_of(query, keys, sizeof keys);
+        log_call("copy ", query, "keys=%s -> %ld match(es)", keys, (long)CFArrayGetCount(hits));
+    }
     OSStatus rc = errSecItemNotFound;
     if (CFArrayGetCount(hits) > 0) {
         rc = errSecSuccess;
@@ -415,27 +471,16 @@ static OSStatus ipa_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     load_items();
     CFMutableDictionaryRef item = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    // keep the attributes and the secret, drop the request flags
-    CFIndex n = CFDictionaryGetCount(attributes);
-    const void **keys = malloc(sizeof(void *) * (size_t)n), **vals = malloc(sizeof(void *) * (size_t)n);
-    CFDictionaryGetKeysAndValues(attributes, keys, vals);
-    for (CFIndex i = 0; i < n; i++) {
-        if (CFEqual(keys[i], kSecClass) || stored_key(keys[i], vals[i]))
-            CFDictionarySetValue(item, keys[i], vals[i]);
-    }
-    free(keys); free(vals);
+    CFDictionaryApplyFunction(attributes, copy_stored, item);   // attributes and secret, not the request flags
     CFDictionarySetValue(item, kSecClass, item_class(attributes));
-    {
-        CFTypeRef g = CFDictionaryGetValue(attributes, kSecAttrAccessGroup);
-        CFDictionarySetValue(item, kSecAttrAccessGroup,
-            (g && CFGetTypeID(g) == CFStringGetTypeID()) ? g : (CFTypeRef)access_group());
-    }
+    CFTypeRef given = CFDictionaryGetValue(attributes, kSecAttrAccessGroup);
+    CFDictionarySetValue(item, kSecAttrAccessGroup,
+        (given && CFGetTypeID(given) == CFStringGetTypeID()) ? given : (CFTypeRef)access_group());
     OSStatus rc = errSecSuccess;
     for (CFIndex i = 0; i < CFArrayGetCount(g_items); i++)
         if (same_primary(CFArrayGetValueAtIndex(g_items, i), item)) { rc = errSecDuplicateItem; break; }
-    { char a[256], sv[256]; cfstr(attributes, kSecAttrAccount, a, sizeof a); cfstr(attributes, kSecAttrService, sv, sizeof sv);
-      klog("add   %s acct=%s svce=%s data=%s -> %s", cls_of(attributes), a, sv,
-           CFDictionaryGetValue(attributes, kSecValueData) ? "yes" : "no", rc == errSecSuccess ? "ok" : "dup"); }
+    log_call("add  ", attributes, "data=%s -> %s",
+             CFDictionaryGetValue(attributes, kSecValueData) ? "yes" : "no", rc == errSecSuccess ? "ok" : "dup");
     if (rc == errSecSuccess) {
         CFDateRef now = CFDateCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent());
         CFDictionarySetValue(item, kSecAttrCreationDate, now);
@@ -453,23 +498,18 @@ static OSStatus ipa_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     return rc;
 }
 
-static void apply_update(const void *key, const void *value, void *ctx) {
-    if (stored_key(key, value)) CFDictionarySetValue((CFMutableDictionaryRef)ctx, key, value);
-}
-
 static OSStatus ipa_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef update) {
     if (!query || !update || !is_password_class(query)) return SecItemUpdate(query, update);
     pthread_mutex_lock(&g_lock);
     load_items();
     CFMutableArrayRef hits = find_matches(query);
-    { char a[256], sv[256]; cfstr(query, kSecAttrAccount, a, sizeof a); cfstr(query, kSecAttrService, sv, sizeof sv);
-      klog("update %s acct=%s svce=%s -> %ld match(es)", cls_of(query), a, sv, (long)CFArrayGetCount(hits)); }
+    log_call("update", query, "-> %ld match(es)", (long)CFArrayGetCount(hits));
     OSStatus rc = errSecItemNotFound;
     if (CFArrayGetCount(hits) > 0) {
         CFDateRef now = CFDateCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent());
         for (CFIndex i = 0; i < CFArrayGetCount(hits); i++) {
             CFMutableDictionaryRef it = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(hits, i);
-            CFDictionaryApplyFunction(update, apply_update, it);
+            CFDictionaryApplyFunction(update, copy_stored, it);
             CFDictionarySetValue(it, kSecAttrModificationDate, now);
         }
         CFRelease(now);
@@ -489,8 +529,7 @@ static OSStatus ipa_SecItemDelete(CFDictionaryRef query) {
     for (CFIndex i = CFArrayGetCount(g_items) - 1; i >= 0; i--) {
         if (item_matches(CFArrayGetValueAtIndex(g_items, i), query)) { CFArrayRemoveValueAtIndex(g_items, i); rc = errSecSuccess; }
     }
-    { char a[256], sv[256]; cfstr(query, kSecAttrAccount, a, sizeof a); cfstr(query, kSecAttrService, sv, sizeof sv);
-      klog("delete %s acct=%s svce=%s -> %s", cls_of(query), a, sv, rc == errSecSuccess ? "ok" : "none"); }
+    log_call("delete", query, "-> %s", rc == errSecSuccess ? "ok" : "none");
     if (rc == errSecSuccess) save_items();
     pthread_mutex_unlock(&g_lock);
     return rc;
