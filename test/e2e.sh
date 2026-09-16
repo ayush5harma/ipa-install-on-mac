@@ -6,7 +6,7 @@
 # lands, and every touch it received. Only lines logged after each launch's
 # own marker count, so nothing an earlier launch wrote can pass a check.
 #
-# Three installs and a --configure, 22 checks:
+# Three installs and a --configure, 23 checks:
 #
 #   default     shipped idiom, the binary's own SDK kept, sandboxed, the
 #               embedded framework loads, dlsym(RTLD_DEFAULT, "gl...") answers
@@ -198,6 +198,17 @@ if launch; then
 else
   bad "the probe did not launch"
 fi
+# --open on a bundle LaunchServices refuses to launch: the settings are
+# written and the refusal is reported, but it is not a failure of the
+# configure. Inside a function `open ... && echo` is subject to set -e where
+# the same line at top level was not (measured 2026-09-16: rc 1 and "failed
+# at line 255" although the settings had been written), so this holds the
+# extracted configure_installed_app to the old exit status.
+quit_probe
+mv "$APP/Probe" "$APP/Probe.aside"
+"$CLI" --configure "$BID" --resolution 1600x900 --open >/dev/null 2>"$W/err"; rc=$?
+mv "$APP/Probe.aside" "$APP/Probe"
+check "--configure --open exits 0 when the app cannot be launched" test "$rc" -eq 0
 
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

@@ -43,9 +43,9 @@ def text_section_offset(image, off):
     """The lowest file offset among the __TEXT sections of the segment command
     at OFF, or None. The load commands may grow up to there and no further.
 
-    The section table is walked for every segment, not only __TEXT: reading
-    past the end of a segment that lies about its section count raises here,
-    which is how a malformed binary is refused before anything is written."""
+    The section table is walked for every segment, not only __TEXT: a segment
+    whose section count runs past the end of the image raises here, which is
+    how a malformed binary is refused before anything is written."""
     is_text = image[off + 8:off + 24].split(b"\0", 1)[0] == b"__TEXT"
     offsets = []
     nsects = struct.unpack_from("<I", image, off + 64)[0]

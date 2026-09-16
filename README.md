@@ -288,7 +288,7 @@ is `~/Library/Caches/ipa-install-on-mac`.
 presses, keychain results and GL lookups it sees), installs it three ways,
 launches it, and reads what the probe logged after that launch's own marker:
 a default install, `--mac-idiom` with a `--dylib` source, a `--playtools`
-install, and a `--configure` change taking effect on relaunch. 22 checks.
+install, and a `--configure` change taking effect on relaunch. 23 checks.
 
 ```
 test/e2e.sh
