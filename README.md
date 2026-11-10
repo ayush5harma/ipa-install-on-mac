@@ -169,7 +169,7 @@ and every step has a direct CLI equivalent:
 The bare iOS `.app` becomes the Mac app, in place: the platform keys in
 `Info.plist` are not touched and the bundle is not wrapped in anything.
 
-Four more things are added because a real *app* needs them:
+Six more things are added because a real *app* needs them:
 
 - **Rendering.** The app keeps the idiom it shipped with, so an iPad app runs
   in its iPad layout, which Catalyst scales to 77% on a Mac. `--mac-idiom`
@@ -183,6 +183,13 @@ Four more things are added because a real *app* needs them:
 - **App-group folders it can write**, inside the app's own container, because
   macOS denies an ad-hoc signed app its app groups. See ["App groups live in
   the app's container"](#app-groups-live-in-the-apps-container).
+- **Calls without CallKit**, for apps that link it: CallKit cannot serve an
+  ad-hoc signed app, so the app's own "use CallKit?" checks answer no and an
+  app with its own call path (WhatsApp) takes it. See ["CallKit cannot serve
+  an ad-hoc app"](#callkit-cannot-serve-an-ad-hoc-app).
+- **Camera frame rates a Mac camera can do**, for apps that link
+  AVFoundation. See ["iPhone frame rates on a Mac
+  webcam"](#iphone-frame-rates-on-a-mac-webcam).
 
 The sandbox entitlements are PlayCover's base set: `app-sandbox` plus network
 client and server, camera, microphone, Bluetooth, USB, contacts, calendars,
@@ -291,7 +298,7 @@ is `~/Library/Caches/ipa-install-on-mac`.
 presses, keychain results, app-group writes and GL lookups it sees), installs it three ways,
 launches it, and reads what the probe logged after that launch's own marker:
 a default install, `--mac-idiom` with a `--dylib` source, a `--playtools`
-install, and a `--configure` change taking effect on relaunch. 26 checks.
+install, and a `--configure` change taking effect on relaunch. 28 checks.
 
 ```
 test/e2e.sh
@@ -310,6 +317,13 @@ next to a library that hooks `SecItem*` by rewriting symbol pointers
 (`test/rebind-hook.c`, the way Watusi's `libWatusiToolsSL.dylib` does), and
 checks that every call comes back -- for keys, which the shim passes on to the
 real keychain, as much as for passwords, which it answers itself. 9 checks.
+
+`test/call-shims.sh` needs no app and no camera either. It links the CallKit
+shim into a probe whose classes have the shapes of WhatsApp's call manager and
+checks every CallKit question answers no-CallKit while other methods keep
+their answers, and runs the camera shim's wrapper on stand-in devices with
+fixed and ranged formats, and that all six real AVFoundation setters are
+wrapped at load. 18 checks.
 
 ## Measured details
 
@@ -425,6 +439,42 @@ names answer OpenGL ES's symbol, NULL for desktop-only ones, and everything
 else reaches the real `dlsym` -- by tail call, so `RTLD_NEXT`/`RTLD_SELF`
 still resolve relative to their real caller. The editor then opens and
 applies edits.
+
+### CallKit cannot serve an ad-hoc app
+
+`callservicesd` keys every CallKit client by its application identifier, and
+an ad-hoc signature has none (only a provisioning profile grants one; claiming
+it ad-hoc makes AMFI refuse to start the app). Measured 2026-11-11 on macOS
+27.3 with WhatsApp 26.42.77: at every launch the daemon logs "Not accepting
+connection ... callsourcehost because a CXXPCCallSource couldn't be created",
+and when a call is placed its `CXStartCallAction` arrives "for connection with
+identifier: (null)" and `callservicesd` itself dies on
+`-[__NSDictionaryM setObject:forKeyedSubscript:]` with a nil key. Voice and
+video both stop there, before audio, camera or network. `lib/ipa-callkit.m`,
+linked into apps that link CallKit, finds the app's own per-call questions by
+selector (WhatsApp's `isCallKitSupported`, `isCallKitDisabled`,
+`shouldUseCallKitForCallWithVideo:...` and two more, 11 methods across
+`WACallManager`, `WACallManagerBase` and `WACallProviderDelegate`) and answers
+them "no CallKit"; WhatsApp then runs calls on its own audio session and they
+connect. The cost is what CallKit adds on iOS: no system call UI and no
+"Recents" entry. An app with no path of its own around CallKit is not helped,
+and an app that asks a question not in the list needs it added.
+
+### iPhone frame rates on a Mac webcam
+
+iPhone cameras offer variable frame-rate ranges, so iOS apps set
+`activeVideoMinFrameDuration`/`activeVideoMaxFrameDuration` freely; many Mac
+webcams offer one fixed rate per format, and AVFoundation throws for anything
+outside it. Measured 2026-11-11: a WhatsApp video call on a Lenovo FHD Webcam
+(1280x720, 30-30 fps) asked for a 10 fps minimum and died on "Unsupported
+frame duration - Supported ranges: 30 - 30". The throw comes from inside
+AVFoundation's own `dispatch_barrier_sync`, so catching it would unwind
+through libdispatch with the device's queue still held. `lib/ipa-camera.m`,
+linked into apps that link AVFoundation, wraps both setters on
+`AVCaptureDevice` and its two concrete classes (each implements them itself)
+and moves an unsupported duration to the nearest bound of the nearest
+supported range before AVFoundation sees it; supported durations and the
+`kCMTimeInvalid` reset pass untouched. The same call then ran at 30 fps.
 
 ### How PlayTools is built and embedded
 

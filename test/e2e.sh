@@ -6,7 +6,7 @@
 # lands, and every touch it received. Only lines logged after each launch's
 # own marker count, so nothing an earlier launch wrote can pass a check.
 #
-# Three installs and a --configure, 26 checks:
+# Three installs and a --configure, 28 checks:
 #
 #   default     shipped idiom, the binary's own SDK kept, sandboxed, the
 #               embedded framework loads, dlsym(RTLD_DEFAULT, "gl...") answers
@@ -124,6 +124,8 @@ check "the binary keeps its own SDK ($SDK)" stamped_sdk "$SDK"
 check "sandboxed" has_entitlement app-sandbox
 check "OpenGL ES redirect linked (the probe links OpenGL ES)" reported 'opengl es:'
 check "app-group shim linked" links 'libipagroups.dylib'
+check "CallKit shim linked (the probe links CallKit)" links 'libipacallkit.dylib'
+check "camera shim linked (the probe links AVFoundation)" links 'libipacamera.dylib'
 if launch; then
   check "shipped idiom (iPad, 1)" logged ' launch idiom=1 '
   check "embedded framework loaded" logged 'probekit ok'

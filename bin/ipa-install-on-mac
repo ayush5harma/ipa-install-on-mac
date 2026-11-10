@@ -12,7 +12,8 @@
 #   4. convert every Mach-O: arm64, Mac Catalyst, the system Swift overlay
 #   5. rendering: the shipped idiom, or the Mac idiom on request
 #   6. link in what the app needs -- PlayTools (--playtools), the keychain
-#      shim, the OpenGL ES redirect, the app-group shim, --dylib libraries
+#      shim, the OpenGL ES redirect, the CallKit and camera shims, the
+#      app-group shim, --dylib libraries
 #   7. sign every Mach-O, then every nested bundle, then the app itself
 #   8. write PlayTools' settings, then move the bundle into place
 #
@@ -602,6 +603,41 @@ if grep -F '/OpenGLES.framework/' "$WORK/linked" >/dev/null; then
   GLES_NOTE="links OpenGL ES: run-time GL lookups answered by OpenGL ES, not desktop GL (libipagles)"
 fi
 
+# ── Calls: off CallKit, and frame rates the Mac camera can do ──────────────
+# CallKit cannot serve an ad-hoc signed app: callservicesd keys every client
+# by its application identifier, which only a provisioning profile grants, so
+# it refuses the app's provider, and a placed call crashes callservicesd
+# itself (nil identifier; measured 2026-11-11, WhatsApp). lib/ipa-callkit.m
+# answers the app's own "use CallKit for this call?" checks with no, so an
+# app with a non-CallKit path takes it. lib/ipa-camera.m keeps
+# activeVideoMin/MaxFrameDuration inside the active camera format's ranges:
+# an iOS app asks for iPhone-style variable rates, a fixed-rate Mac webcam
+# makes AVFoundation throw, and the app dies on its first video frame setup
+# (same day, WhatsApp video call on a 30-30 fps webcam). Each is linked only
+# into an app that links the framework it corrects.
+CALLKIT_NOTE=""; CAMERA_NOTE=""
+if grep -F '/CallKit.framework/' "$WORK/linked" >/dev/null; then
+  need_lib ipa-callkit.m
+  need_sdk "install Xcode"
+  CALLKIT_LIB="$APP/Frameworks/libipacallkit.dylib"
+  mkdir -p "$APP/Frameworks"
+  catalyst_dylib "$CALLKIT_LIB" @executable_path/Frameworks/libipacallkit.dylib \
+    "$LIB_DIR/ipa-callkit.m" "could not build the CallKit shim" -O2 -fobjc-arc -framework Foundation
+  link_into_app "$CALLKIT_LIB" @executable_path/Frameworks/libipacallkit.dylib "the CallKit shim"
+  CALLKIT_NOTE="CallKit cannot serve an ad-hoc app; the app's own CallKit checks answer no (libipacallkit)"
+fi
+if grep -F '/AVFoundation.framework/' "$WORK/linked" >/dev/null; then
+  need_lib ipa-camera.m
+  need_sdk "install Xcode"
+  CAMERA_LIB="$APP/Frameworks/libipacamera.dylib"
+  mkdir -p "$APP/Frameworks"
+  catalyst_dylib "$CAMERA_LIB" @executable_path/Frameworks/libipacamera.dylib \
+    "$LIB_DIR/ipa-camera.m" "could not build the camera shim" -O2 -fobjc-arc \
+    -framework Foundation -framework AVFoundation -framework CoreMedia
+  link_into_app "$CAMERA_LIB" @executable_path/Frameworks/libipacamera.dylib "the camera shim"
+  CAMERA_NOTE="frame-rate requests kept inside what the active camera format supports (libipacamera)"
+fi
+
 # ── App groups: each group's folder inside the app's own container ─────────
 # An ad-hoc signature cannot hold an app group macOS honours (a "group." id
 # needs a provisioning profile, and no profile can name another team's group),
@@ -820,6 +856,8 @@ fi
 echo "  rendering: $RENDER"
 echo "  keychain:  $KEYCHAIN_NOTE"
 [ -z "$GLES_NOTE" ] || echo "  opengl es: $GLES_NOTE"
+[ -z "$CALLKIT_NOTE" ] || echo "  calls:     $CALLKIT_NOTE"
+[ -z "$CAMERA_NOTE" ] || echo "  camera:    $CAMERA_NOTE"
 echo "  app groups: folders in the container under Library/Group Containers (libipagroups)"
 [ -z "$DYLIB_NOTE" ] || echo "  linked:    $DYLIB_NOTE (--dylib)"
 [ -z "$NEUTRALISED" ] || echo "  neutralised keychain-fix tweak(s):$NEUTRALISED"
