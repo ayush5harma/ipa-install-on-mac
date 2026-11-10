@@ -41,6 +41,7 @@ plist_strings "$APP/Frameworks/ProbeKit.framework/Info.plist" \
 xcrun clang -target "$TARGET" -isysroot "$SDK" -fobjc-arc -fmodules \
   -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
   -framework UIKit -framework Foundation -framework Security -framework OpenGLES \
+  -framework CallKit -framework AVFoundation \
   -Wl,-rpath,@executable_path/Frameworks \
   "$APP/Frameworks/ProbeKit.framework/ProbeKit" \
   -o "$APP/Probe" "$HERE/probe.m"
